@@ -1,9 +1,9 @@
-requests
-whisper-openai
-pyttsx3
+openai-whisper
+transformers==4.35.2
+torch
+google-generativeai
+gTTS
 moviepy
 google-api-python-client
 google-auth-oauthlib
 google-auth-httplib2
-facebook-sdk
-requests_toolbelt
