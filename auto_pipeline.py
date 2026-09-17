@@ -1,5 +1,8 @@
 import os
+import json
 import time
+from datetime import datetime, timezone
+
 import requests
 import numpy as np
 import PIL.Image
@@ -10,12 +13,24 @@ from moviepy import (
     concatenate_audioclips, TextClip, CompositeVideoClip, AudioClip
 )
 
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+
 WIDTH, HEIGHT = 1080, 1920
 TARGET_DURATION = 60.0  # final video will always be exactly this long
 PEXELS_KEY = os.environ.get("PEXELS_API_KEY")
 
 # Font used for on-screen captions (installed via apt in the workflow: fonts-dejavu-core)
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+
+VIDEO_TITLE = "Space is Completely Silent 🤯 #shorts"
+VIDEO_DESCRIPTION = (
+    "Did you know space has no sound? Subscribe for a new mind-blowing "
+    "space fact every single day! #space #shorts #facts #astronomy"
+)
+VIDEO_TAGS = ["space", "shorts", "facts", "science", "astronomy", "space facts"]
 
 
 def fetch_clip(query, duration_needed, index):
@@ -45,6 +60,8 @@ def fetch_clip(query, duration_needed, index):
                     clips_list.append(clip)
                     cur_dur += clip.duration
                 return concatenate_videoclips(clips_list).subclipped(0, duration_needed)
+            else:
+                print(f"Pexels returned status {resp.status_code} for query '{query}': {resp.text[:200]}")
         except Exception as e:
             print(f"Attempt {attempt+1} failed for {query}: {e}")
             time.sleep(2)
@@ -73,6 +90,96 @@ def add_caption(bg_clip, caption_text, duration, is_cta=False):
     except Exception as e:
         print(f"Caption failed for text '{caption_text[:30]}...': {e}")
         return bg_clip
+
+
+def get_youtube_client():
+    """Build an authenticated YouTube API client from the TOKEN_JSON and
+    CLIENT_SECRET_JSON secrets, refreshing the access token if needed."""
+    token_raw = os.environ.get("TOKEN_JSON")
+    client_raw = os.environ.get("CLIENT_SECRET_JSON")
+
+    if not token_raw:
+        raise RuntimeError("TOKEN_JSON secret is missing or empty.")
+    if not client_raw:
+        raise RuntimeError("CLIENT_SECRET_JSON secret is missing or empty.")
+
+    token_data = json.loads(token_raw)
+    client_data = json.loads(client_raw)
+    # Google Cloud Console downloads wrap this under "installed" or "web"
+    client_info = client_data.get("installed") or client_data.get("web") or client_data
+
+    creds = Credentials(
+        token=token_data.get("token"),
+        refresh_token=token_data.get("refresh_token"),
+        token_uri=token_data.get("token_uri", "https://oauth2.googleapis.com/token"),
+        client_id=token_data.get("client_id") or client_info.get("client_id"),
+        client_secret=token_data.get("client_secret") or client_info.get("client_secret"),
+        scopes=token_data.get("scopes", ["https://www.googleapis.com/auth/youtube.upload"]),
+    )
+
+    if not creds.valid:
+        if creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            raise RuntimeError(
+                "Stored credentials are invalid/expired and no refresh_token is available. "
+                "You'll need to regenerate TOKEN_JSON."
+            )
+
+    return build("youtube", "v3", credentials=creds)
+
+
+def upload_to_youtube(video_path):
+    youtube = get_youtube_client()
+
+    body = {
+        "snippet": {
+            "title": VIDEO_TITLE,
+            "description": VIDEO_DESCRIPTION,
+            "tags": VIDEO_TAGS,
+            "categoryId": "28",  # Science & Technology
+        },
+        "status": {
+            "privacyStatus": "public",
+            "selfDeclaredMadeForKids": False,
+        },
+    }
+
+    media = MediaFileUpload(video_path, chunksize=-1, resumable=True, mimetype="video/mp4")
+    request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
+
+    response = None
+    while response is None:
+        status, response = request.next_chunk()
+        if status:
+            print(f"Upload progress: {int(status.progress() * 100)}%")
+
+    video_id = response["id"]
+    print(f"Uploaded successfully: https://youtube.com/shorts/{video_id}")
+    return video_id
+
+
+def update_tracker(video_id):
+    tracker_file = "upload_tracker.json"
+    data = []
+    if os.path.exists(tracker_file):
+        try:
+            with open(tracker_file) as f:
+                data = json.load(f)
+            if not isinstance(data, list):
+                data = []
+        except Exception:
+            data = []
+
+    data.append({
+        "video_id": video_id,
+        "title": VIDEO_TITLE,
+        "uploaded_at": datetime.now(timezone.utc).isoformat(),
+        "url": f"https://youtube.com/shorts/{video_id}",
+    })
+
+    with open(tracker_file, "w") as f:
+        json.dump(data, f, indent=2)
 
 
 def generate_video():
@@ -120,13 +227,9 @@ def generate_video():
     current_duration = min(final_audio.duration, final_video.duration)
 
     if current_duration > TARGET_DURATION:
-        # Content ran long: trim down to exactly TARGET_DURATION
         final_audio = final_audio.subclipped(0, TARGET_DURATION)
         final_video = final_video.subclipped(0, TARGET_DURATION)
     elif current_duration < TARGET_DURATION:
-        # Content ran short: pad with silence + a frozen last frame instead of
-        # repeating the whole story, so there is no jarring repeat and no
-        # silent/broken audio.
         pad = TARGET_DURATION - current_duration
         silence = AudioClip(lambda t: 0, duration=pad, fps=44100)
         final_audio = concatenate_audioclips([final_audio, silence])
@@ -135,13 +238,16 @@ def generate_video():
         freeze = ImageClip(last_frame).with_duration(pad)
         final_video = concatenate_videoclips([final_video, freeze])
 
-    # Final safety trim so both are exactly equal length
     final_duration = min(final_audio.duration, final_video.duration)
     final_audio = final_audio.subclipped(0, final_duration)
     final_video = final_video.subclipped(0, final_duration)
 
     final = final_video.with_audio(final_audio)
-    final.write_videofile("final_short.mp4", fps=30, codec="libx264", audio_codec="aac", bitrate="5000k")
+    output_path = "final_short.mp4"
+    final.write_videofile(output_path, fps=30, codec="libx264", audio_codec="aac", bitrate="5000k")
+
+    video_id = upload_to_youtube(output_path)
+    update_tracker(video_id)
 
 
 if __name__ == "__main__":
