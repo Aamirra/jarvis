@@ -2,6 +2,7 @@ import os
 import json
 import random
 import requests
+import numpy as np
 from gtts import gTTS
 from PIL import Image, ImageDraw, ImageFont
 from moviepy.editor import VideoFileClip, AudioFileClip, ImageClip, CompositeVideoClip
@@ -16,7 +17,6 @@ VIDEO_PATH = "final_short.mp4"
 TOKEN_PATH = "token.json"
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 
-# 40-50 Second Detailed Facts for High Retention
 FACTS = [
     {
         "topic": "space", 
@@ -74,7 +74,7 @@ def generate_video():
     audio = AudioFileClip("voiceover.mp3")
     duration = audio.duration
 
-    # Background Video from Pexels (Up to 60 seconds)
+    # Background Video from Pexels
     PEXELS_KEY = os.getenv("PEXELS_API_KEY")
     video_file = "bg_video.mp4"
     bg_clip = None
@@ -88,14 +88,14 @@ def generate_video():
                 video_url = res["videos"][0]["video_files"][0]["link"]
                 with open(video_file, "wb") as f:
                     f.write(requests.get(video_url).content)
-                
-                # Extended limit to 60 seconds
                 bg_clip = VideoFileClip(video_file).subclip(0, min(duration, 60)).resize((WIDTH, HEIGHT))
         except Exception as e:
             print(f"Pexels fetch failed: {e}")
 
+    # Fixed fallback background clip using NumPy array
     if bg_clip is None:
-        bg_clip = ImageClip(Image.new("RGB", (WIDTH, HEIGHT), "black")).set_duration(duration)
+        black_frame = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
+        bg_clip = ImageClip(black_frame).set_duration(duration)
 
     # Text Overlay Image
     create_text_image(script_text)
