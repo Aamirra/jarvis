@@ -31,4 +31,6 @@ jobs:
       - name: Generate Video and Upload to YouTube
         env:
           TOKEN_JSON: ${{ secrets.TOKEN_JSON }}
+          CLIENT_SECRET_JSON: ${{ secrets.CLIENT_SECRET_JSON }}
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
         run: python auto_pipeline.py
