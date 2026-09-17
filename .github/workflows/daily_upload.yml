@@ -1,37 +1,35 @@
-name: Daily YouTube Short Upload
+name: Daily YouTube Shorts Upload
 
 on:
   schedule:
-    - cron: "0 3,9,15 * * *"
+    - cron: "0 12 * * *"   # runs daily at 12:00 UTC — change to your preferred time
   workflow_dispatch:
 
 jobs:
-  build-and-upload:
+  generate-and-upload:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v3
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.11"
 
-      - name: Install System Dependencies
+      - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg espeak libespeak1 espeak-data espeak-ng
+          sudo apt-get install -y ffmpeg fonts-dejavu-core
 
-      - name: Install Python Dependencies
+      - name: Install Python dependencies
         run: |
-          pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install --upgrade pip
+          pip install gTTS "moviepy==1.0.3" Pillow \
+                      google-auth google-auth-oauthlib google-api-python-client
 
-      - name: Generate Video
-        run: python maker.py
-
-      - name: Run Auto Pipeline
+      - name: Generate Video and Upload to YouTube
         env:
-          CLIENT_SECRET_JSON: ${{ secrets.CLIENT_SECRET_JSON }}
           TOKEN_JSON: ${{ secrets.TOKEN_JSON }}
         run: python auto_pipeline.py
