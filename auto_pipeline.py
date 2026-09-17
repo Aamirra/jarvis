@@ -99,3 +99,21 @@ print("Upload Successful! Video ID:", response.get('id'))
 tracker["count"] += 1
 with open(TRACK_FILE, "w") as f:
     json.dump(tracker, f)
+
+import requests
+import json
+import os
+
+def upload_to_instagram(video_path, caption, access_token, instagram_account_id):
+    print('[IG] Uploading Reel to Instagram...')
+    url = f'https://graph.facebook.com/v18.0/{instagram_account_id}/media'
+    payload = {'media_type': 'REELS', 'video_url': video_path, 'caption': caption, 'access_token': access_token}
+    r = requests.post(url, data=payload)
+    print('[IG Container Result]:', r.json())
+
+def upload_to_facebook(video_path, caption, page_access_token, page_id):
+    print('[FB] Uploading Reel to Facebook Page...')
+    url = f'https://graph.facebook.com/v18.0/{page_id}/video_reels'
+    payload = {'upload_phase': 'start', 'access_token': page_access_token}
+    r = requests.post(url, data=payload)
+    print('[FB Start Result]:', r.json())
