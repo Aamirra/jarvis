@@ -7,11 +7,11 @@ if not hasattr(PIL.Image, "ANTIALIAS"): PIL.Image.ANTIALIAS = PIL.Image.Resampli
 from gtts import gTTS
 from moviepy import (
     VideoFileClip, AudioFileClip, ImageClip, concatenate_videoclips,
-    concatenate_audioclips, TextClip, CompositeVideoClip
+    concatenate_audioclips, TextClip, CompositeVideoClip, AudioClip
 )
 
 WIDTH, HEIGHT = 1080, 1920
-MIN_DURATION = 60.0  # minimum final video length in seconds
+TARGET_DURATION = 60.0  # final video will always be exactly this long
 PEXELS_KEY = os.environ.get("PEXELS_API_KEY")
 
 # Font used for on-screen captions (installed via apt in the workflow: fonts-dejavu-core)
@@ -52,18 +52,18 @@ def fetch_clip(query, duration_needed, index):
     return ImageClip(np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)).with_duration(duration_needed)
 
 
-def add_caption(bg_clip, text, duration):
+def add_caption(bg_clip, caption_text, duration, is_cta=False):
     """Overlay on-screen caption text on top of a background clip. Falls back
     to the plain background clip if caption rendering fails for any reason,
     so the pipeline never crashes just because of a font/text issue."""
     try:
         caption = TextClip(
             font=FONT_PATH,
-            text=text,
-            font_size=58,
-            color="white",
+            text=caption_text,
+            font_size=72 if is_cta else 58,
+            color="yellow" if is_cta else "white",
             stroke_color="black",
-            stroke_width=2,
+            stroke_width=3 if is_cta else 2,
             method="caption",
             size=(int(WIDTH * 0.85), None),
             text_align="center",
@@ -71,51 +71,71 @@ def add_caption(bg_clip, text, duration):
 
         return CompositeVideoClip([bg_clip, caption], size=(WIDTH, HEIGHT)).with_duration(duration)
     except Exception as e:
-        print(f"Caption failed for text '{text[:30]}...': {e}")
+        print(f"Caption failed for text '{caption_text[:30]}...': {e}")
         return bg_clip
 
 
 def generate_video():
+    # Each scene: spoken text, Pexels search query, is this the subscribe CTA scene,
+    # and an optional shorter on-screen caption (falls back to the spoken text).
     scenes = [
-        ("Did you know that space is completely silent?", "deep space cosmos silence"),
-        ("Sound waves require a medium like air to travel, and because space is a vacuum, molecules are too far apart to carry sound.", "space vacuum stars"),
-        ("If you screamed in space, no one would hear you.", "astronaut floating space"),
-        ("This eerie silence stretches across the entire universe, making the cosmos both breathtaking and strangely terrifying.", "galaxy spinning nebula"),
-        ("Planets, stars, and galaxies move in complete quiet, hidden behind the vastness of interstellar dark matter.", "planet orbiting space dark")
+        {"text": "Did you know that space is completely silent?",
+         "query": "deep space cosmos silence"},
+        {"text": "Sound waves require a medium like air to travel, and because space is a vacuum, molecules are too far apart to carry sound.",
+         "query": "space vacuum stars"},
+        {"text": "If you screamed in space, no one would hear you.",
+         "query": "astronaut floating space"},
+        {"text": "This eerie silence stretches across the entire universe, making the cosmos both breathtaking and strangely terrifying.",
+         "query": "galaxy spinning nebula"},
+        {"text": "Planets, stars, and galaxies move in complete quiet, hidden behind the vastness of interstellar dark matter.",
+         "query": "planet orbiting space dark"},
+        {"text": "Even massive explosions like supernovas produce no sound that could ever reach your ears.",
+         "query": "supernova explosion space"},
+        {"text": "Scientists instead study space through light, radiation, and gravitational waves rather than sound.",
+         "query": "telescope observing space"},
+        {"text": "The next time you look up at the night sky, remember that all of that beauty is happening in absolute silence.",
+         "query": "night sky stars milky way"},
+        {"text": "If this blew your mind, hit that subscribe button and turn on notifications, because we post a brand new space fact every single day.",
+         "query": "colorful nebula space bright",
+         "cta": True,
+         "caption": "SUBSCRIBE FOR MORE!"},
     ]
 
     audio_clips = []
     video_clips = []
-    for i, (text, query) in enumerate(scenes):
+    for i, scene in enumerate(scenes):
         fname = f"part_{i}.mp3"
-        gTTS(text=text, lang="en").save(fname)
+        gTTS(text=scene["text"], lang="en").save(fname)
         aclip = AudioFileClip(fname)
         audio_clips.append(aclip)
 
-        bg_clip = fetch_clip(query, aclip.duration, i)
-        scene_clip = add_caption(bg_clip, text, aclip.duration)
+        bg_clip = fetch_clip(scene["query"], aclip.duration, i)
+        caption_text = scene.get("caption", scene["text"])
+        scene_clip = add_caption(bg_clip, caption_text, aclip.duration, is_cta=scene.get("cta", False))
         video_clips.append(scene_clip)
 
-    # Base story (single pass through all scenes, audio+video already in sync)
-    story_audio_clips = list(audio_clips)
-    story_video_clips = list(video_clips)
-    base_duration = sum(a.duration for a in audio_clips)
-    total_dur = base_duration
+    final_audio = concatenate_audioclips(audio_clips)
+    final_video = concatenate_videoclips(video_clips)
 
-    # If the story is shorter than MIN_DURATION, repeat the WHOLE story
-    # (audio + video together) so audio and video always stay in sync.
-    # This avoids the old bug where only the video was looped while the
-    # audio's duration was force-extended without real sound, causing
-    # silent/broken audio in the extra part of the video.
-    while total_dur < MIN_DURATION:
-        story_audio_clips += audio_clips
-        story_video_clips += video_clips
-        total_dur += base_duration
+    current_duration = min(final_audio.duration, final_video.duration)
 
-    final_audio = concatenate_audioclips(story_audio_clips)
-    final_video = concatenate_videoclips(story_video_clips)
+    if current_duration > TARGET_DURATION:
+        # Content ran long: trim down to exactly TARGET_DURATION
+        final_audio = final_audio.subclipped(0, TARGET_DURATION)
+        final_video = final_video.subclipped(0, TARGET_DURATION)
+    elif current_duration < TARGET_DURATION:
+        # Content ran short: pad with silence + a frozen last frame instead of
+        # repeating the whole story, so there is no jarring repeat and no
+        # silent/broken audio.
+        pad = TARGET_DURATION - current_duration
+        silence = AudioClip(lambda t: 0, duration=pad, fps=44100)
+        final_audio = concatenate_audioclips([final_audio, silence])
 
-    # Trim both to the exact same length just in case of tiny float mismatches
+        last_frame = final_video.get_frame(max(final_video.duration - 0.04, 0))
+        freeze = ImageClip(last_frame).with_duration(pad)
+        final_video = concatenate_videoclips([final_video, freeze])
+
+    # Final safety trim so both are exactly equal length
     final_duration = min(final_audio.duration, final_video.duration)
     final_audio = final_audio.subclipped(0, final_duration)
     final_video = final_video.subclipped(0, final_duration)
