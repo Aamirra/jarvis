@@ -1,48 +1,29 @@
 import os
-import glob
-import requests
-import whisper
-import pyttsx3
-import json
-from datetime import date
-from moviepy import VideoFileClip, AudioFileClip, TextClip, CompositeVideoClip, ColorClip
+from moviepy import *
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
+import pyttsx3
+import whisper
+import glob
+import json
 
-# --- TRACKER ---
-TRACK_FILE = "upload_tracker.json"
-today = str(date.today())
-tracker = {"date": today, "count": 0}
-if os.path.exists(TRACK_FILE):
-    try:
-        with open(TRACK_FILE, "r") as f:
-            data = json.load(f)
-            if data.get("date") == today:
-                tracker = data
-    except Exception:
-        pass
+# --- CONFIG ---
+TRACK_FILE = "video_tracker.json"
+
+if not os.path.exists(TRACK_FILE):
+    with open(TRACK_FILE, "w") as f:
+        json.dump({"count": 0}, f)
+
+with open(TRACK_FILE, "r") as f:
+    tracker = json.load(f)
 
 if tracker["count"] >= 3:
-    print(f"[LIMIT REACHED] Aaj ke 3 Shorts poore ho chuke hain ({today}).")
+    print("Daily limit of 3 videos reached.")
     exit()
 
-# --- SCRIPT ---
-print("[1/5] Generating script...")
-script_text = ""
-try:
-    response = requests.post('http://localhost:11434/api/generate', json={
-        'model': 'llama3.2',
-        'prompt': 'Write a short 30-second viral Youtube Short script about 3 shocking unknown facts. Keep it strictly under 50 words, plain text only, no headings, no stage directions.',
-        'stream': False
-    }, timeout=5)
-    if response.status_code == 200:
-        script_text = response.json().get('response', '').strip()
-except Exception:
-    pass
-
-if not script_text:
-    script_text = "3 mind blowing space facts. Space is completely silent. There is a giant cloud of alcohol in space. One day on Venus is longer than a year."
+# Simple fallback text
+script_text = "3 mind blowing space facts. Space is completely silent. There is a giant cloud of alcohol in space. One day on Venus is longer than a year."
 
 # --- AUDIO & CAPTIONS ---
 engine = pyttsx3.init()
@@ -56,8 +37,17 @@ result = model.transcribe("voiceover.mp3")
 # --- VIDEO ---
 video = ColorClip(size=(1080, 1920), color=(15, 15, 30), duration=audio.duration).with_audio(audio)
 subtitles = []
+
+# Font configured for Linux
 for segment in result['segments']:
-    txt_clip = TextClip(text=segment['text'], font_size=48, color='yellow', font='C:\\\\Windows\\\\Fonts\\\\arial.ttf', method='caption', size=(800, None))
+    txt_clip = TextClip(
+        text=segment['text'],
+        font_size=48,
+        color='yellow',
+        font='DejaVu-Sans',  # Updated for cross-platform compatibility
+        method='caption',
+        size=(800, None)
+    )
     txt_clip = txt_clip.with_position(('center', 'center')).with_start(segment['start']).with_end(segment['end'])
     subtitles.append(txt_clip)
 
@@ -66,6 +56,7 @@ CompositeVideoClip([video] + subtitles).write_videofile("automated_daily_short.m
 # --- AUTO FIND SECRET FILE ---
 print("[5/5] Searching for OAuth Secret File...")
 possible_paths = glob.glob("C:/Users/HP/Desktop/client_secret*.json") + glob.glob("C:/Users/HP/client_secret*.json")
+
 if not possible_paths:
     raise FileNotFoundError("client_secret file nahi mili!")
 
@@ -75,8 +66,8 @@ print(f"Found Secret File: {secret_file}")
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 flow = InstalledAppFlow.from_client_secrets_file(secret_file, SCOPES)
 credentials = flow.run_local_server(port=0)
-youtube = build("youtube", "v3", credentials=credentials)
 
+youtube = build("youtube", "v3", credentials=credentials)
 request = youtube.videos().insert(
     part="snippet,status",
     body={
@@ -99,21 +90,3 @@ print("Upload Successful! Video ID:", response.get('id'))
 tracker["count"] += 1
 with open(TRACK_FILE, "w") as f:
     json.dump(tracker, f)
-
-import requests
-import json
-import os
-
-def upload_to_instagram(video_path, caption, access_token, instagram_account_id):
-    print('[IG] Uploading Reel to Instagram...')
-    url = f'https://graph.facebook.com/v18.0/{instagram_account_id}/media'
-    payload = {'media_type': 'REELS', 'video_url': video_path, 'caption': caption, 'access_token': access_token}
-    r = requests.post(url, data=payload)
-    print('[IG Container Result]:', r.json())
-
-def upload_to_facebook(video_path, caption, page_access_token, page_id):
-    print('[FB] Uploading Reel to Facebook Page...')
-    url = f'https://graph.facebook.com/v18.0/{page_id}/video_reels'
-    payload = {'upload_phase': 'start', 'access_token': page_access_token}
-    r = requests.post(url, data=payload)
-    print('[FB Start Result]:', r.json())
