@@ -27,6 +27,9 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Generate Video
+        run: python maker.py
+
       - name: Run Auto Pipeline
         env:
           CLIENT_SECRET_JSON: ${{ secrets.CLIENT_SECRET_JSON }}
