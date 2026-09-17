@@ -1,172 +1,81 @@
 import os
-import json
-import random
+import time
 import requests
-import math
 import numpy as np
+import PIL.Image
+if not hasattr(PIL.Image, "ANTIALIAS"): PIL.Image.ANTIALIAS = PIL.Image.Resampling.LANCZOS
 from gtts import gTTS
-from PIL import Image, ImageDraw, ImageFont
-from moviepy.editor import VideoFileClip, AudioFileClip, ImageClip, CompositeVideoClip, concatenate_videoclips
-from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
-
+from moviepy import VideoFileClip, AudioFileClip, ImageClip, concatenate_videoclips
 WIDTH, HEIGHT = 1080, 1920
-VIDEO_PATH = "final_short.mp4"
-TOKEN_PATH = "token.json"
-SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
-
-FACTS = [
-    {
-        "topic": "space",
-        "script": [
-            {"text": "Did you know that space is completely silent?", "query": "space galaxy dark"},
-            {"text": "There is a giant cloud of alcohol floating in deep space!", "query": "nebula cosmos"},
-            {"text": "A full NASA space suit costs around 12 million dollars!", "query": "astronaut space suit"}
-        ]
-    },
-    {
-        "topic": "ocean",
-        "script": [
-            {"text": "The ocean holds 99 percent of the living space on Earth.", "query": "deep ocean water"},
-            {"text": "We know more about Mars than our ocean floor!", "query": "underwater seabed"},
-            {"text": "Deep down in the ocean, there are underwater rivers and waterfalls!", "query": "underwater current ocean"}
-        ]
-    },
-    {
-        "topic": "brain",
-        "script": [
-            {"text": "Your brain generates enough electricity to power a small light bulb!", "query": "human brain glowing neural"},
-            {"text": "It processes information at a speed of 268 miles per hour.", "query": "digital network speed light"},
-            {"text": "It consumes 20 percent of your total energy!", "query": "human body energy glow"}
-        ]
-    }
-]
-
-def create_text_image(text):
-    img = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
+PEXELS_KEY = os.environ.get("PEXELS_API_KEY")
+def fetch_clip(query, duration_needed, index):
+    headers = {"Authorization": PEXELS_KEY}
+    url = "https://api.pexels.com/videos/search?query=" + query + chr(38) + "per_page=1"
+    video_file = f"bg_{index}.mp4"
     
-    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-    font = ImageFont.truetype(font_path, 42) if os.path.exists(font_path) else ImageFont.load_default()
-
-    import textwrap
-    lines = textwrap.wrap(text, width=28)
-    line_height = 55
-    total_text_height = len(lines) * line_height
-    start_y = (HEIGHT - total_text_height) // 2
-
-    draw.rectangle([60, start_y - 30, WIDTH - 60, start_y + total_text_height + 30], fill=(0, 0, 0, 180))
-
-    for i, line in enumerate(lines):
-        bbox = draw.textbbox((0, 0), line, font=font)
-        w = bbox[2] - bbox[0]
-        x = (WIDTH - w) // 2
-        y = start_y + i * line_height
-        draw.text((x, y), line, font=font, fill="white")
-
-    img.save("text_overlay.png")
-
-def download_pexels_video(query, idx):
-    PEXELS_KEY = os.getenv("PEXELS_API_KEY")
-    if not PEXELS_KEY:
-        return None
-    try:
-        headers = {"Authorization": PEXELS_KEY}
-        url = f"https://api.pexels.com/videos/search?query={query}&orientation=portrait&per_page=3"
-        res = requests.get(url, headers=headers).json()
-        videos = res.get("videos", [])
-        if videos:
-            v_url = videos[0]["video_files"][0]["link"]
-            fname = f"clip_{idx}.mp4"
-            with open(fname, "wb") as f:
-                f.write(requests.get(v_url).content)
-            return fname
-    except Exception as e:
-        print(f"Failed download for {query}: {e}")
-    return None
+    for attempt in range(3):
+        try:
+            time.sleep(1)
+            resp = requests.get(url, headers=headers, timeout=10)
+            if resp.status_code == 200 and resp.json().get("videos"):
+                v_files = resp.json()["videos"][0]["video_files"]
+                hd_file = max(v_files, key=lambda x: x.get("width", 0))
+                with open(video_file, "wb") as vf:
+                    vf.write(requests.get(hd_file["link"], timeout=15).content)
+                clip = VideoFileClip(video_file).without_audio()
+                w, h = clip.size
+                scale = HEIGHT / h
+                new_w = int(w * scale)
+                clip = clip.resized((new_w, HEIGHT))
+                x1 = (new_w - WIDTH) // 2
+                clip = clip.cropped(x1=x1, y1=0, x2=x1+WIDTH, y2=HEIGHT)
+                clips_list = []
+                cur_dur = 0
+                while cur_dur < duration_needed:
+                    clips_list.append(clip)
+                    cur_dur += clip.duration
+                return concatenate_videoclips(clips_list).subclipped(0, duration_needed)
+        except Exception as e:
+            print(f"Attempt {attempt+1} failed for {query}: {e}")
+            time.sleep(2)
+    
+    return ImageClip(np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)).with_duration(duration_needed)
 
 def generate_video():
-    selected = random.choice(FACTS)
-    topic = selected["topic"]
-    script_segments = selected["script"]
+    scenes = [
+        ("Did you know that space is completely silent?", "deep space cosmos silence"),
+        ("Sound waves require a medium like air to travel, and because space is a vacuum, molecules are too far apart to carry sound.", "space vacuum stars"),
+        ("If you screamed in space, no one would hear you.", "astronaut floating space"),
+        ("This eerie silence stretches across the entire universe, making the cosmos both breathtaking and strangely terrifying.", "galaxy spinning nebula"),
+        ("Planets, stars, and galaxies move in complete quiet, hidden behind the vastness of interstellar dark matter.", "planet orbiting space dark")
+    ]
     
-    full_text = " ".join([seg["text"] for seg in script_segments])
+    audio_clips = []
+    video_clips = []
+    for i, (text, query) in enumerate(scenes):
+        fname = f"part_{i}.mp3"
+        gTTS(text=text, lang="en").save(fname)
+        aclip = AudioFileClip(fname)
+        audio_clips.append(aclip)
+        vclip = fetch_clip(query, aclip.duration, i)
+        video_clips.append(vclip)
     
-    # Generate Voiceover
-    tts = gTTS(text=full_text, lang='en', slow=False)
-    tts.save("voiceover.mp3")
-    audio = AudioFileClip("voiceover.mp3")
-    total_duration = audio.duration
-
-    segment_duration = total_duration / len(script_segments)
-    clips = []
-
-    for idx, seg in enumerate(script_segments):
-        fname = download_pexels_video(seg["query"], idx)
-        if fname and os.path.exists(fname):
-            vc = VideoFileClip(fname).without_audio().resize((WIDTH, HEIGHT))
-            clip = vc.subclip(0, min(vc.duration, segment_duration + 0.5))
-            if idx > 0:
-                clip = clip.crossfadein(0.5)
-            clips.append(clip)
-
-    if not clips:
-        black_frame = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
-        bg_clip = ImageClip(black_frame).set_duration(total_duration)
-    else:
-        bg_clip = concatenate_videoclips(clips, padding=-0.5, method="compose").subclip(0, total_duration)
-
-    # Text Overlay
-    create_text_image(full_text)
-    txt_clip = ImageClip("text_overlay.png").set_duration(total_duration)
-
-    # Final Composite
-    final_clip = CompositeVideoClip([bg_clip, txt_clip]).set_audio(audio)
-    final_clip.write_videofile(VIDEO_PATH, fps=24, codec="libx264", audio_codec="aac")
-    return full_text, topic
-
-def write_token_file():
-    token_json = os.environ.get("TOKEN_JSON")
-    if not token_json:
-        raise RuntimeError("TOKEN_JSON variable missing")
-    with open(TOKEN_PATH, "w") as f:
-        f.write(token_json)
-
-def get_youtube_service():
-    creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
-    if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-    return build("youtube", "v3", credentials=creds)
-
-def upload_video(youtube, description, topic):
-    body = {
-        "snippet": {
-            "title": f"Mind Blowing {topic.capitalize()} Facts! #Shorts",
-            "description": f"{description}\n\n#Shorts #{topic.capitalize()} #Facts #AI",
-            "tags": ["shorts", topic, "facts"],
-            "categoryId": "27",
-        },
-        "status": {
-            "privacyStatus": "public",
-            "selfDeclaredMadeForKids": False,
-        },
-    }
-    media = MediaFileUpload(VIDEO_PATH, chunksize=-1, resumable=True, mimetype="video/mp4")
-    request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
-
-    response = None
-    while response is None:
-        status, response = request.next_chunk()
-
-    print(f"[upload] Done: https://youtube.com/shorts/{response['id']}")
-
-def main():
-    script_text, topic = generate_video()
-    write_token_file()
-    youtube = get_youtube_service()
-    upload_video(youtube, script_text, topic)
-
-if __name__ == "__main__":
-    main()
+    from moviepy import concatenate_audioclips
+    final_audio = concatenate_audioclips(audio_clips)
+    final_video = concatenate_videoclips(video_clips)
+    
+    final_clips_list = []
+    total_dur = 0
+    target_dur = max(final_audio.duration, 60.0)
+    while total_dur < target_dur:
+        for v in video_clips:
+            final_clips_list.append(v)
+            total_dur += v.duration
+            if total_dur >= target_dur: break
+    
+    final_video = concatenate_videoclips(final_clips_list).subclipped(0, target_dur)
+    final_audio = final_audio.with_duration(target_dur)
+    
+    final = final_video.with_audio(final_audio)
+    final.write_videofile("final_short.mp4", fps=30, codec="libx264", audio_codec="aac", bitrate="5000k")
+if __name__ == "__main__": generate_video()
