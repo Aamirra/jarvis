@@ -38,13 +38,12 @@ result = model.transcribe("voiceover.mp3")
 video = ColorClip(size=(1080, 1920), color=(15, 15, 30), duration=audio.duration).with_audio(audio)
 subtitles = []
 
-# Font configured for Linux
+# Font parameter removed to avoid system-font dependency errors
 for segment in result['segments']:
     txt_clip = TextClip(
         text=segment['text'],
         font_size=48,
         color='yellow',
-        font='DejaVu-Sans',  # Updated for cross-platform compatibility
         method='caption',
         size=(800, None)
     )
