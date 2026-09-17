@@ -7,13 +7,11 @@ import numpy as np
 from gtts import gTTS
 from PIL import Image, ImageDraw, ImageFont
 from moviepy.editor import VideoFileClip, AudioFileClip, ImageClip, CompositeVideoClip, concatenate_videoclips
-import moviepy.video.fx.all as vfx
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
-# Config
 WIDTH, HEIGHT = 1080, 1920
 VIDEO_PATH = "final_short.mp4"
 TOKEN_PATH = "token.json"
@@ -21,16 +19,28 @@ SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 
 FACTS = [
     {
-        "topic": "space", 
-        "text": "Did you know that space is completely silent? There is no atmosphere in space, which means sound has no way to travel to be heard. Plus, floating in deep space, there is a giant cloud of alcohol containing trillions of liters! Also, a full NASA space suit costs around 12 million dollars!"
+        "topic": "space",
+        "script": [
+            {"text": "Did you know that space is completely silent?", "query": "space galaxy dark"},
+            {"text": "There is a giant cloud of alcohol floating in deep space!", "query": "nebula cosmos"},
+            {"text": "A full NASA space suit costs around 12 million dollars!", "query": "astronaut space suit"}
+        ]
     },
     {
-        "topic": "ocean", 
-        "text": "The ocean holds 99 percent of the living space on Earth, yet we have explored less than 5 percent of it. We actually know more about the surface of Mars and the Moon than our own ocean floor! Deep down in the ocean, there are underwater rivers, waterfalls, and lakes!"
+        "topic": "ocean",
+        "script": [
+            {"text": "The ocean holds 99 percent of the living space on Earth.", "query": "deep ocean water"},
+            {"text": "We know more about Mars than our ocean floor!", "query": "underwater seabed"},
+            {"text": "Deep down in the ocean, there are underwater rivers and waterfalls!", "query": "underwater current ocean"}
+        ]
     },
     {
-        "topic": "brain", 
-        "text": "Your brain generates about 20 watts of electricity, which is enough power to light up a dim LED bulb! It processes information at a speed of 268 miles per hour. Even though it makes up only 2 percent of your body mass, it consumes 20 percent of your total energy!"
+        "topic": "brain",
+        "script": [
+            {"text": "Your brain generates enough electricity to power a small light bulb!", "query": "human brain glowing neural"},
+            {"text": "It processes information at a speed of 268 miles per hour.", "query": "digital network speed light"},
+            {"text": "It consumes 20 percent of your total energy!", "query": "human body energy glow"}
+        ]
     }
 ]
 
@@ -39,22 +49,15 @@ def create_text_image(text):
     draw = ImageDraw.Draw(img)
     
     font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-    if os.path.exists(font_path):
-        font = ImageFont.truetype(font_path, 42)
-    else:
-        font = ImageFont.load_default()
+    font = ImageFont.truetype(font_path, 42) if os.path.exists(font_path) else ImageFont.load_default()
 
     import textwrap
     lines = textwrap.wrap(text, width=28)
-    
     line_height = 55
     total_text_height = len(lines) * line_height
     start_y = (HEIGHT - total_text_height) // 2
 
-    padding = 30
-    box_top = start_y - padding
-    box_bottom = start_y + total_text_height + padding
-    draw.rectangle([60, box_top, WIDTH - 60, box_bottom], fill=(0, 0, 0, 180))
+    draw.rectangle([60, start_y - 30, WIDTH - 60, start_y + total_text_height + 30], fill=(0, 0, 0, 180))
 
     for i, line in enumerate(lines):
         bbox = draw.textbbox((0, 0), line, font=font)
@@ -65,76 +68,69 @@ def create_text_image(text):
 
     img.save("text_overlay.png")
 
+def download_pexels_video(query, idx):
+    PEXELS_KEY = os.getenv("PEXELS_API_KEY")
+    if not PEXELS_KEY:
+        return None
+    try:
+        headers = {"Authorization": PEXELS_KEY}
+        url = f"https://api.pexels.com/videos/search?query={query}&orientation=portrait&per_page=3"
+        res = requests.get(url, headers=headers).json()
+        videos = res.get("videos", [])
+        if videos:
+            v_url = videos[0]["video_files"][0]["link"]
+            fname = f"clip_{idx}.mp4"
+            with open(fname, "wb") as f:
+                f.write(requests.get(v_url).content)
+            return fname
+    except Exception as e:
+        print(f"Failed download for {query}: {e}")
+    return None
+
 def generate_video():
     selected = random.choice(FACTS)
-    script_text = selected["text"]
-    search_query = selected["topic"]
+    topic = selected["topic"]
+    script_segments = selected["script"]
     
-    # 1. Voiceover & Length
-    tts = gTTS(text=script_text, lang='en', slow=False)
+    full_text = " ".join([seg["text"] for seg in script_segments])
+    
+    # Generate Voiceover
+    tts = gTTS(text=full_text, lang='en', slow=False)
     tts.save("voiceover.mp3")
     audio = AudioFileClip("voiceover.mp3")
-    duration = audio.duration
+    total_duration = audio.duration
 
-    # Calculate clips needed for smooth flow (4 seconds each)
-    CLIP_DURATION = 4.0
-    num_clips_needed = math.ceil(duration / CLIP_DURATION)
-
-    PEXELS_KEY = os.getenv("PEXELS_API_KEY")
+    segment_duration = total_duration / len(script_segments)
     clips = []
 
-    if PEXELS_KEY:
-        try:
-            headers = {"Authorization": PEXELS_KEY}
-            url = f"https://api.pexels.com/videos/search?query={search_query}&orientation=portrait&per_page={max(15, num_clips_needed + 5)}"
-            res = requests.get(url, headers=headers).json()
-            videos = res.get("videos", [])
-            
-            downloaded_files = []
-            for idx, vid in enumerate(videos[:num_clips_needed]):
-                v_files = vid.get("video_files", [])
-                v_url = v_files[0]["link"]
-                fname = f"bg_{idx}.mp4"
-                with open(fname, "wb") as f:
-                    f.write(requests.get(v_url).content)
-                downloaded_files.append(fname)
+    for idx, seg in enumerate(script_segments):
+        fname = download_pexels_video(seg["query"], idx)
+        if fname and os.path.exists(fname):
+            vc = VideoFileClip(fname).without_audio().resize((WIDTH, HEIGHT))
+            clip = vc.subclip(0, min(vc.duration, segment_duration + 0.5))
+            if idx > 0:
+                clip = clip.crossfadein(0.5)
+            clips.append(clip)
 
-            # Process clips with Seamless Transitions
-            padding = 0.5  # overlap for smooth crossfade
-            for idx, fname in enumerate(downloaded_files):
-                vc = VideoFileClip(fname).without_audio().resize((WIDTH, HEIGHT))
-                c_dur = min(vc.duration, CLIP_DURATION + padding)
-                clip = vc.subclip(0, c_dur)
-                
-                # Add crossfade to avoid jarring cuts between scenes
-                if idx > 0:
-                    clip = clip.crossfadein(0.5)
-                clips.append(clip)
-
-        except Exception as e:
-            print(f"Pexels fetch failed: {e}")
-
-    # Fallback to black screen if API fails
     if not clips:
         black_frame = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
-        bg_clip = ImageClip(black_frame).set_duration(duration)
+        bg_clip = ImageClip(black_frame).set_duration(total_duration)
     else:
-        # Seamlessly blend video clips together
-        bg_clip = concatenate_videoclips(clips, padding=-0.5, method="compose").subclip(0, duration)
+        bg_clip = concatenate_videoclips(clips, padding=-0.5, method="compose").subclip(0, total_duration)
 
-    # 3. Text Overlay
-    create_text_image(script_text)
-    txt_clip = ImageClip("text_overlay.png").set_duration(duration)
+    # Text Overlay
+    create_text_image(full_text)
+    txt_clip = ImageClip("text_overlay.png").set_duration(total_duration)
 
-    # 4. Export
+    # Final Composite
     final_clip = CompositeVideoClip([bg_clip, txt_clip]).set_audio(audio)
     final_clip.write_videofile(VIDEO_PATH, fps=24, codec="libx264", audio_codec="aac")
-    return script_text, search_query
+    return full_text, topic
 
 def write_token_file():
     token_json = os.environ.get("TOKEN_JSON")
     if not token_json:
-        raise RuntimeError("TOKEN_JSON environment variable is not set.")
+        raise RuntimeError("TOKEN_JSON variable missing")
     with open(TOKEN_PATH, "w") as f:
         f.write(token_json)
 
@@ -149,7 +145,7 @@ def upload_video(youtube, description, topic):
         "snippet": {
             "title": f"Mind Blowing {topic.capitalize()} Facts! #Shorts",
             "description": f"{description}\n\n#Shorts #{topic.capitalize()} #Facts #AI",
-            "tags": ["shorts", topic, "facts", "educational"],
+            "tags": ["shorts", topic, "facts"],
             "categoryId": "27",
         },
         "status": {
@@ -163,11 +159,8 @@ def upload_video(youtube, description, topic):
     response = None
     while response is None:
         status, response = request.next_chunk()
-        if status:
-            print(f"[upload] {int(status.progress() * 100)}% uploaded")
 
-    video_id = response["id"]
-    print(f"[upload] Done: https://youtube.com/shorts/{video_id}")
+    print(f"[upload] Done: https://youtube.com/shorts/{response['id']}")
 
 def main():
     script_text, topic = generate_video()
