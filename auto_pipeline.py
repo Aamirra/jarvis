@@ -4,20 +4,23 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
-# GitHub Secrets se token.json generate karna
+# 1. Script Text Define Karein
+script_text = "3 mind blowing space facts. Space is completely silent. There is a giant cloud of alcohol in space. One day on Venus is longer than a year."
+
+# 2. GitHub Secrets se token.json generate karna
 token_data = os.environ.get("TOKEN_JSON")
 if token_data:
     with open("token.json", "w") as f:
         f.write(token_data)
 
-# Authenticate using token.json
+# 3. Authenticate using token.json
 if os.path.exists("token.json"):
     creds = Credentials.from_authorized_user_file("token.json")
     youtube = build("youtube", "v3", credentials=creds)
 else:
     raise FileNotFoundError("TOKEN_JSON file nahi mili!")
 
-# Upload Video
+# 4. Upload Video to YouTube
 request = youtube.videos().insert(
     part="snippet,status",
     body={
