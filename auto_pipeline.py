@@ -16,10 +16,20 @@ VIDEO_PATH = "final_short.mp4"
 TOKEN_PATH = "token.json"
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 
+# 40-50 Second Detailed Facts for High Retention
 FACTS = [
-    {"topic": "space", "text": "Did you know that space is completely silent? There is no atmosphere in space, which means sound has no way to travel. Plus, there is a giant cloud of alcohol floating in deep space!"},
-    {"topic": "ocean", "text": "The ocean holds 99 percent of the living space on Earth. We have explored less than 5 percent of our oceans, meaning we know more about Mars than our own sea floor!"},
-    {"topic": "brain", "text": "Your brain generates about 20 watts of electricity. That is enough power to light a dim LED bulb! It also processes information as fast as 268 miles per hour."}
+    {
+        "topic": "space", 
+        "text": "Did you know that space is completely silent? There is no atmosphere in space, which means sound has no way to travel to be heard. Plus, floating in deep space, there is a giant cloud of alcohol containing trillions of liters! Also, a full NASA space suit costs around 12 million dollars!"
+    },
+    {
+        "topic": "ocean", 
+        "text": "The ocean holds 99 percent of the living space on Earth, yet we have explored less than 5 percent of it. We actually know more about the surface of Mars and the Moon than our own ocean floor! Deep down in the ocean, there are underwater rivers, waterfalls, and lakes!"
+    },
+    {
+        "topic": "brain", 
+        "text": "Your brain generates about 20 watts of electricity, which is enough power to light up a dim LED bulb! It processes information at a speed of 268 miles per hour. Even though it makes up only 2 percent of your body mass, it consumes 20 percent of your total energy!"
+    }
 ]
 
 def create_text_image(text):
@@ -35,18 +45,15 @@ def create_text_image(text):
     import textwrap
     lines = textwrap.wrap(text, width=28)
     
-    # Calculate box height
     line_height = 55
     total_text_height = len(lines) * line_height
     start_y = (HEIGHT - total_text_height) // 2
 
-    # Draw dark background box for text
     padding = 30
     box_top = start_y - padding
     box_bottom = start_y + total_text_height + padding
     draw.rectangle([60, box_top, WIDTH - 60, box_bottom], fill=(0, 0, 0, 180))
 
-    # Draw text lines
     for i, line in enumerate(lines):
         bbox = draw.textbbox((0, 0), line, font=font)
         w = bbox[2] - bbox[0]
@@ -67,7 +74,7 @@ def generate_video():
     audio = AudioFileClip("voiceover.mp3")
     duration = audio.duration
 
-    # Background Video from Pexels
+    # Background Video from Pexels (Up to 60 seconds)
     PEXELS_KEY = os.getenv("PEXELS_API_KEY")
     video_file = "bg_video.mp4"
     bg_clip = None
@@ -81,7 +88,9 @@ def generate_video():
                 video_url = res["videos"][0]["video_files"][0]["link"]
                 with open(video_file, "wb") as f:
                     f.write(requests.get(video_url).content)
-                bg_clip = VideoFileClip(video_file).subclip(0, min(duration, 20)).resize((WIDTH, HEIGHT))
+                
+                # Extended limit to 60 seconds
+                bg_clip = VideoFileClip(video_file).subclip(0, min(duration, 60)).resize((WIDTH, HEIGHT))
         except Exception as e:
             print(f"Pexels fetch failed: {e}")
 
