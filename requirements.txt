@@ -1,0 +1,7 @@
+requests
+whisper-openai
+pyttsx3
+moviepy
+google-api-python-client
+google-auth-oauthlib
+google-auth-httplib2
