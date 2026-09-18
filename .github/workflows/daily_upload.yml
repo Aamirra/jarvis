@@ -35,3 +35,12 @@ jobs:
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python auto_pipeline.py
+
+      - name: Save video for manual TikTok upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tiktok-video-${{ github.run_id }}
+          path: final_short.mp4
+          retention-days: 2
+          if-no-files-found: warn
