@@ -2,7 +2,7 @@ pyttsx3
 openai-whisper
 transformers==4.35.2
 torch
-google-generativeai
+google-genai
 gTTS
 moviepy>=2.0,<3
 google-api-python-client
