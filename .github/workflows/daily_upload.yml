@@ -2,7 +2,7 @@ name: Daily YouTube Shorts Upload
 
 on:
   schedule:
-    - cron: "0 12 * * *"   # runs daily at 12:00 UTC — change to your preferred time
+    - cron: "0 0,6,12,18 * * *"   # runs 4 times a day, every 6 hours (UTC)
   workflow_dispatch:
 
 jobs:
@@ -33,4 +33,5 @@ jobs:
           TOKEN_JSON: ${{ secrets.TOKEN_JSON }}
           CLIENT_SECRET_JSON: ${{ secrets.CLIENT_SECRET_JSON }}
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python auto_pipeline.py
