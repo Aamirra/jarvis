@@ -140,7 +140,7 @@ Rules:
 """
 
 
-def generate_script_with_ai(content_type):
+def generate_script_with_ai(content_type, max_attempts=3):
     if not GEMINI_KEY:
         print("GEMINI_API_KEY not set, using fallback script.")
         return FALLBACK_SCRIPTS[content_type]
@@ -157,18 +157,51 @@ def generate_script_with_ai(content_type):
 
     try:
         client = genai.Client(api_key=GEMINI_KEY)
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json"),
-        )
-        data = json.loads(response.text)
-        if not data.get("scenes") or not data.get("title"):
-            raise ValueError("AI response missing required fields")
-        return data
     except Exception as e:
-        print(f"AI script generation failed, using fallback script: {e}")
+        print(f"Could not create Gemini client, using fallback script: {type(e).__name__}: {e}")
         return FALLBACK_SCRIPTS[content_type]
+
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(response_mime_type="application/json"),
+            )
+
+            raw_text = getattr(response, "text", None)
+            if not raw_text:
+                # Often means the response was empty or blocked by safety filters
+                raise ValueError(
+                    f"Empty response from Gemini (prompt_feedback={getattr(response, 'prompt_feedback', None)})"
+                )
+
+            cleaned = raw_text.strip()
+            if cleaned.startswith("```"):
+                cleaned = cleaned.strip("`")
+                if cleaned.lower().startswith("json"):
+                    cleaned = cleaned[4:].strip()
+
+            data = json.loads(cleaned)
+
+            if not data.get("title") or not data.get("scenes"):
+                raise ValueError("AI response JSON is missing 'title' or 'scenes'.")
+            for scene in data["scenes"]:
+                if not scene.get("text") or not scene.get("query"):
+                    raise ValueError("A scene in the AI response is missing 'text' or 'query'.")
+
+            print(f"Gemini script generated successfully on attempt {attempt}/{max_attempts}.")
+            return data
+
+        except Exception as e:
+            last_error = e
+            print(f"[Attempt {attempt}/{max_attempts}] Gemini script generation failed: {type(e).__name__}: {e}")
+            if attempt < max_attempts:
+                time.sleep(3 * attempt)  # brief backoff before retrying
+
+    print(f"All {max_attempts} Gemini attempts failed, using fallback script. Last error: {last_error}")
+    return FALLBACK_SCRIPTS[content_type]
 
 
 def fetch_clip(query, duration_needed, index):
