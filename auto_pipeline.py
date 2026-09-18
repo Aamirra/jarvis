@@ -13,6 +13,9 @@ from moviepy import (
     concatenate_audioclips, TextClip, CompositeVideoClip, AudioClip
 )
 
+from google import genai
+from google.genai import types
+
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
@@ -21,16 +24,151 @@ from googleapiclient.http import MediaFileUpload
 WIDTH, HEIGHT = 1080, 1920
 TARGET_DURATION = 60.0  # final video will always be exactly this long
 PEXELS_KEY = os.environ.get("PEXELS_API_KEY")
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
+GEMINI_MODEL = "gemini-3.1-flash-lite"  # cheap + fast, plenty for short scripts
+
+TRACKER_FILE = "upload_tracker.json"
 
 # Font used for on-screen captions (installed via apt in the workflow: fonts-dejavu-core)
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
-VIDEO_TITLE = "Space is Completely Silent 🤯 #shorts"
-VIDEO_DESCRIPTION = (
-    "Did you know space has no sound? Subscribe for a new mind-blowing "
-    "space fact every single day! #space #shorts #facts #astronomy"
-)
-VIDEO_TAGS = ["space", "shorts", "facts", "science", "astronomy", "space facts"]
+CTA_SCENE = {
+    "text": "If this blew your mind, hit that subscribe button and turn on notifications, because we post brand new videos every single day.",
+    "query": "colorful nebula space bright",
+    "cta": True,
+    "caption": "SUBSCRIBE FOR MORE!",
+}
+
+# Used only if AI script generation fails, so the pipeline never crashes.
+FALLBACK_SCRIPTS = {
+    "random": {
+        "title": "Space is Completely Silent",
+        "scenes": [
+            {"text": "Did you know that space is completely silent?", "query": "deep space cosmos silence"},
+            {"text": "Sound waves require a medium like air to travel, and because space is a vacuum, molecules are too far apart to carry sound.", "query": "space vacuum stars"},
+            {"text": "If you screamed in space, no one would hear you.", "query": "astronaut floating space"},
+            {"text": "This eerie silence stretches across the entire universe, making the cosmos both breathtaking and strangely terrifying.", "query": "galaxy spinning nebula"},
+            {"text": "Planets, stars, and galaxies move in complete quiet, hidden behind the vastness of interstellar dark matter.", "query": "planet orbiting space dark"},
+        ],
+    },
+    "ai_tips": {
+        "title": "This One Prompt Trick Changes Everything",
+        "scenes": [
+            {"text": "Most people use AI chatbots completely wrong, and it's costing them much better answers.", "query": "person typing laptop screen"},
+            {"text": "Here's a simple trick: instead of just asking a question, show the AI an example of what you want first.", "query": "hands typing keyboard closeup"},
+            {"text": "This is called few shot prompting, and it works because AI learns better from examples than from instructions alone.", "query": "digital technology abstract lights"},
+            {"text": "For example, instead of asking for a good title, show it two titles you already like, then ask for a third in that same style.", "query": "notebook writing ideas desk"},
+            {"text": "Try this in your very next chat with any AI tool, and watch how much better the answer gets.", "query": "smartphone chat app screen"},
+        ],
+    },
+}
+
+
+def choose_content_type():
+    """Decide today's content type from the UTC hour, so the 4 daily runs
+    (every 6 hours) split evenly into 2 random-topic videos and 2 AI-tips
+    videos without needing any extra state file."""
+    hour = datetime.now(timezone.utc).hour
+    if hour in (6, 18):
+        return "ai_tips"
+    return "random"  # covers hour 0, 12, and any manual/off-schedule run
+
+
+def get_past_titles(limit=20):
+    """Read titles of previously uploaded videos so we can ask the AI to
+    avoid repeating the same topic."""
+    if not os.path.exists(TRACKER_FILE):
+        return []
+    try:
+        with open(TRACKER_FILE) as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            return []
+        return [entry.get("title", "") for entry in data[-limit:] if entry.get("title")]
+    except Exception:
+        return []
+
+
+def build_prompt(content_type, avoid_text):
+    if content_type == "ai_tips":
+        return f"""You write short, punchy scripts for a YouTube Shorts channel
+that teaches everyday people practical AI tips, tricks, and beginner concepts
+for using AI chatbots and tools (like ChatGPT, Gemini, Claude, or similar) in
+daily life, work, or study. Assume the viewer is a curious beginner, not a
+programmer.
+
+{avoid_text}
+
+Return ONLY valid JSON in exactly this shape, no extra commentary:
+{{
+  "title": "a short catchy title for the video, under 8 words",
+  "scenes": [
+    {{"text": "one or two spoken sentences", "query": "2-4 word English stock-footage search term for this sentence"}}
+  ]
+}}
+
+Rules:
+- 6 to 8 scenes total.
+- Teach ONE genuinely useful, concrete AI tip, trick, or concept per video (e.g. a prompting technique, a way to save time, a common mistake to avoid, or a simple explanation of how AI works).
+- All scenes combined should read aloud in about 40-45 seconds (roughly 110-140 words total).
+- Start with a hook about a mistake or surprising fact, then explain the tip clearly, then give one short concrete example.
+- Each "query" must describe generic stock video footage (people using devices, offices, technology, abstract digital visuals) - never named apps' logos or real people - so it can be found on a stock footage site.
+- Keep language simple, practical, and conversational, suitable for text-to-speech narration.
+"""
+    else:
+        return f"""You write short, punchy scripts for a "did you know" style
+YouTube Shorts channel about surprising true facts (space, science, history,
+psychology, nature, animals, or the human body - pick ONE topic at random,
+something genuinely surprising and different each time).
+
+{avoid_text}
+
+Return ONLY valid JSON in exactly this shape, no extra commentary:
+{{
+  "title": "a short catchy title for the video, under 8 words",
+  "scenes": [
+    {{"text": "one or two spoken sentences", "query": "2-4 word English stock-footage search term for this sentence"}}
+  ]
+}}
+
+Rules:
+- 6 to 8 scenes total.
+- All scenes combined should read aloud in about 40-45 seconds (roughly 110-140 words total).
+- Each scene's spoken text should flow into the next like a mini story with a hook, build-up, and a surprising payoff.
+- Each "query" must describe generic stock video footage (nature, objects, places, animals) - never named people or brands - so it can be found on a stock footage site.
+- Keep language simple and conversational, suitable for text-to-speech narration.
+"""
+
+
+def generate_script_with_ai(content_type):
+    if not GEMINI_KEY:
+        print("GEMINI_API_KEY not set, using fallback script.")
+        return FALLBACK_SCRIPTS[content_type]
+
+    past_titles = get_past_titles()
+    avoid_text = ""
+    if past_titles:
+        avoid_text = (
+            "Do NOT repeat these topics already covered, pick something different: "
+            + "; ".join(past_titles)
+        )
+
+    prompt = build_prompt(content_type, avoid_text)
+
+    try:
+        client = genai.Client(api_key=GEMINI_KEY)
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(response_mime_type="application/json"),
+        )
+        data = json.loads(response.text)
+        if not data.get("scenes") or not data.get("title"):
+            raise ValueError("AI response missing required fields")
+        return data
+    except Exception as e:
+        print(f"AI script generation failed, using fallback script: {e}")
+        return FALLBACK_SCRIPTS[content_type]
 
 
 def fetch_clip(query, duration_needed, index):
@@ -105,7 +243,6 @@ def get_youtube_client():
 
     token_data = json.loads(token_raw)
     client_data = json.loads(client_raw)
-    # Google Cloud Console downloads wrap this under "installed" or "web"
     client_info = client_data.get("installed") or client_data.get("web") or client_data
 
     creds = Credentials(
@@ -129,15 +266,15 @@ def get_youtube_client():
     return build("youtube", "v3", credentials=creds)
 
 
-def upload_to_youtube(video_path):
+def upload_to_youtube(video_path, title, description, tags):
     youtube = get_youtube_client()
 
     body = {
         "snippet": {
-            "title": VIDEO_TITLE,
-            "description": VIDEO_DESCRIPTION,
-            "tags": VIDEO_TAGS,
-            "categoryId": "28",  # Science & Technology
+            "title": title,
+            "description": description,
+            "tags": tags,
+            "categoryId": "27",  # Education
         },
         "status": {
             "privacyStatus": "public",
@@ -159,12 +296,11 @@ def upload_to_youtube(video_path):
     return video_id
 
 
-def update_tracker(video_id):
-    tracker_file = "upload_tracker.json"
+def update_tracker(video_id, title, content_type):
     data = []
-    if os.path.exists(tracker_file):
+    if os.path.exists(TRACKER_FILE):
         try:
-            with open(tracker_file) as f:
+            with open(TRACKER_FILE) as f:
                 data = json.load(f)
             if not isinstance(data, list):
                 data = []
@@ -173,40 +309,23 @@ def update_tracker(video_id):
 
     data.append({
         "video_id": video_id,
-        "title": VIDEO_TITLE,
+        "title": title,
+        "content_type": content_type,
         "uploaded_at": datetime.now(timezone.utc).isoformat(),
         "url": f"https://youtube.com/shorts/{video_id}",
     })
 
-    with open(tracker_file, "w") as f:
+    with open(TRACKER_FILE, "w") as f:
         json.dump(data, f, indent=2)
 
 
 def generate_video():
-    # Each scene: spoken text, Pexels search query, is this the subscribe CTA scene,
-    # and an optional shorter on-screen caption (falls back to the spoken text).
-    scenes = [
-        {"text": "Did you know that space is completely silent?",
-         "query": "deep space cosmos silence"},
-        {"text": "Sound waves require a medium like air to travel, and because space is a vacuum, molecules are too far apart to carry sound.",
-         "query": "space vacuum stars"},
-        {"text": "If you screamed in space, no one would hear you.",
-         "query": "astronaut floating space"},
-        {"text": "This eerie silence stretches across the entire universe, making the cosmos both breathtaking and strangely terrifying.",
-         "query": "galaxy spinning nebula"},
-        {"text": "Planets, stars, and galaxies move in complete quiet, hidden behind the vastness of interstellar dark matter.",
-         "query": "planet orbiting space dark"},
-        {"text": "Even massive explosions like supernovas produce no sound that could ever reach your ears.",
-         "query": "supernova explosion space"},
-        {"text": "Scientists instead study space through light, radiation, and gravitational waves rather than sound.",
-         "query": "telescope observing space"},
-        {"text": "The next time you look up at the night sky, remember that all of that beauty is happening in absolute silence.",
-         "query": "night sky stars milky way"},
-        {"text": "If this blew your mind, hit that subscribe button and turn on notifications, because we post a brand new space fact every single day.",
-         "query": "colorful nebula space bright",
-         "cta": True,
-         "caption": "SUBSCRIBE FOR MORE!"},
-    ]
+    content_type = choose_content_type()
+    script = generate_script_with_ai(content_type)
+    title = script["title"]
+    scenes = list(script["scenes"]) + [CTA_SCENE]
+
+    print(f"Content type: {content_type} | Today's topic: {title}")
 
     audio_clips = []
     video_clips = []
@@ -246,8 +365,18 @@ def generate_video():
     output_path = "final_short.mp4"
     final.write_videofile(output_path, fps=30, codec="libx264", audio_codec="aac", bitrate="5000k")
 
-    video_id = upload_to_youtube(output_path)
-    update_tracker(video_id)
+    if content_type == "ai_tips":
+        base_tags = ["ai", "aitips", "chatgpt", "productivity", "shorts"]
+    else:
+        base_tags = ["shorts", "facts", "didyouknow"]
+
+    description = (
+        f"{title}\n\nSubscribe for a new video every single day! "
+        f"#shorts #{'aitips' if content_type == 'ai_tips' else 'facts'}"
+    )
+
+    video_id = upload_to_youtube(output_path, title, description, base_tags)
+    update_tracker(video_id, title, content_type)
 
 
 if __name__ == "__main__":
