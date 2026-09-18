@@ -1,5 +1,6 @@
 import os
 import json
+import random
 import time
 from datetime import datetime, timezone
 
@@ -10,7 +11,8 @@ if not hasattr(PIL.Image, "ANTIALIAS"): PIL.Image.ANTIALIAS = PIL.Image.Resampli
 from gtts import gTTS
 from moviepy import (
     VideoFileClip, AudioFileClip, ImageClip, concatenate_videoclips,
-    concatenate_audioclips, TextClip, CompositeVideoClip, AudioClip
+    concatenate_audioclips, TextClip, CompositeVideoClip, AudioClip,
+    CompositeAudioClip
 )
 
 from google import genai
@@ -28,6 +30,7 @@ GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 GEMINI_MODEL = "gemini-3.1-flash-lite"  # cheap + fast, plenty for short scripts
 
 TRACKER_FILE = "upload_tracker.json"
+MUSIC_DIR = "music"  # put a few royalty-free .mp3 files here; one is picked at random each run
 
 # Font used for on-screen captions (installed via apt in the workflow: fonts-dejavu-core)
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
@@ -43,6 +46,7 @@ CTA_SCENE = {
 FALLBACK_SCRIPTS = {
     "random": {
         "title": "Space is Completely Silent",
+        "hashtags": ["space", "facts", "didyouknow", "science", "universe"],
         "scenes": [
             {"text": "Did you know that space is completely silent?", "query": "deep space cosmos silence"},
             {"text": "Sound waves require a medium like air to travel, and because space is a vacuum, molecules are too far apart to carry sound.", "query": "space vacuum stars"},
@@ -53,6 +57,7 @@ FALLBACK_SCRIPTS = {
     },
     "ai_tips": {
         "title": "This One Prompt Trick Changes Everything",
+        "hashtags": ["ai", "aitips", "chatgpt", "prompting", "productivity"],
         "scenes": [
             {"text": "Most people use AI chatbots completely wrong, and it's costing them much better answers.", "query": "person typing laptop screen"},
             {"text": "Here's a simple trick: instead of just asking a question, show the AI an example of what you want first.", "query": "hands typing keyboard closeup"},
@@ -102,6 +107,7 @@ programmer.
 Return ONLY valid JSON in exactly this shape, no extra commentary:
 {{
   "title": "a short catchy title for the video, under 8 words",
+  "hashtags": ["5 to 8 relevant lowercase hashtags for this specific video, no # symbol"],
   "scenes": [
     {{"text": "one or two spoken sentences", "query": "2-4 word English stock-footage search term for this sentence"}}
   ]
@@ -113,6 +119,7 @@ Rules:
 - All scenes combined should read aloud in about 40-45 seconds (roughly 110-140 words total).
 - Start with a hook about a mistake or surprising fact, then explain the tip clearly, then give one short concrete example.
 - Each "query" must describe generic stock video footage (people using devices, offices, technology, abstract digital visuals) - never named apps' logos or real people - so it can be found on a stock footage site.
+- hashtags should mix a couple of broad/high-traffic tags (like "ai", "shorts") with a few specific to this exact tip, to help discovery.
 - Keep language simple, practical, and conversational, suitable for text-to-speech narration.
 """
     else:
@@ -126,6 +133,7 @@ something genuinely surprising and different each time).
 Return ONLY valid JSON in exactly this shape, no extra commentary:
 {{
   "title": "a short catchy title for the video, under 8 words",
+  "hashtags": ["5 to 8 relevant lowercase hashtags for this specific video, no # symbol"],
   "scenes": [
     {{"text": "one or two spoken sentences", "query": "2-4 word English stock-footage search term for this sentence"}}
   ]
@@ -136,6 +144,7 @@ Rules:
 - All scenes combined should read aloud in about 40-45 seconds (roughly 110-140 words total).
 - Each scene's spoken text should flow into the next like a mini story with a hook, build-up, and a surprising payoff.
 - Each "query" must describe generic stock video footage (nature, objects, places, animals) - never named people or brands - so it can be found on a stock footage site.
+- hashtags should mix a couple of broad/high-traffic tags (like "shorts", "facts") with a few specific to this exact topic, to help discovery.
 - Keep language simple and conversational, suitable for text-to-speech narration.
 """
 
@@ -263,6 +272,61 @@ def add_caption(bg_clip, caption_text, duration, is_cta=False):
         return bg_clip
 
 
+def add_title_flash(scene_clip, title_text, flash_duration=1.5):
+    """Overlay a big bold title card for the first ~1.5 seconds of the very
+    first scene, as a stronger scroll-stopping hook. Falls back to the plain
+    scene clip if anything goes wrong."""
+    try:
+        flash_len = min(flash_duration, scene_clip.duration)
+        title_clip = TextClip(
+            font=FONT_PATH,
+            text=title_text.upper(),
+            font_size=80,
+            color="white",
+            stroke_color="black",
+            stroke_width=4,
+            method="caption",
+            size=(int(WIDTH * 0.9), None),
+            text_align="center",
+        ).with_duration(flash_len).with_position(("center", "center"))
+
+        return CompositeVideoClip([scene_clip, title_clip], size=(WIDTH, HEIGHT)).with_duration(scene_clip.duration)
+    except Exception as e:
+        print(f"Title flash failed: {e}")
+        return scene_clip
+
+
+def add_background_music(narration_audio, duration):
+    """Mix a quiet, looped royalty-free track under the narration. Put a few
+    .mp3 files in a 'music' folder in the repo - one is picked at random each
+    run. If the folder is missing or empty, narration plays with no music."""
+    if not os.path.isdir(MUSIC_DIR):
+        print("No 'music' folder found, skipping background music.")
+        return narration_audio
+
+    tracks = [f for f in os.listdir(MUSIC_DIR) if f.lower().endswith((".mp3", ".wav", ".m4a"))]
+    if not tracks:
+        print("'music' folder is empty, skipping background music.")
+        return narration_audio
+
+    try:
+        track_path = os.path.join(MUSIC_DIR, random.choice(tracks))
+        music = AudioFileClip(track_path)
+
+        loop_clips = []
+        cur_dur = 0
+        while cur_dur < duration:
+            loop_clips.append(music)
+            cur_dur += music.duration
+        music_full = concatenate_audioclips(loop_clips).subclipped(0, duration)
+        music_quiet = music_full.with_volume_scaled(0.15)  # keep narration clearly audible
+
+        return CompositeAudioClip([narration_audio, music_quiet])
+    except Exception as e:
+        print(f"Background music failed, continuing without it: {e}")
+        return narration_audio
+
+
 def get_youtube_client():
     """Build an authenticated YouTube API client from the TOKEN_JSON and
     CLIENT_SECRET_JSON secrets, refreshing the access token if needed."""
@@ -371,6 +435,8 @@ def generate_video():
         bg_clip = fetch_clip(scene["query"], aclip.duration, i)
         caption_text = scene.get("caption", scene["text"])
         scene_clip = add_caption(bg_clip, caption_text, aclip.duration, is_cta=scene.get("cta", False))
+        if i == 0:
+            scene_clip = add_title_flash(scene_clip, title)
         video_clips.append(scene_clip)
 
     final_audio = concatenate_audioclips(audio_clips)
@@ -394,6 +460,8 @@ def generate_video():
     final_audio = final_audio.subclipped(0, final_duration)
     final_video = final_video.subclipped(0, final_duration)
 
+    final_audio = add_background_music(final_audio, final_duration)
+
     final = final_video.with_audio(final_audio)
     output_path = "final_short.mp4"
     final.write_videofile(output_path, fps=30, codec="libx264", audio_codec="aac", bitrate="5000k")
@@ -403,12 +471,13 @@ def generate_video():
     else:
         base_tags = ["shorts", "facts", "didyouknow"]
 
-    description = (
-        f"{title}\n\nSubscribe for a new video every single day! "
-        f"#shorts #{'aitips' if content_type == 'ai_tips' else 'facts'}"
-    )
+    ai_hashtags = [h.strip().lstrip("#").lower() for h in script.get("hashtags", []) if h.strip()]
+    all_tags = list(dict.fromkeys(ai_hashtags + base_tags))  # AI's topic-specific tags first, deduped
 
-    video_id = upload_to_youtube(output_path, title, description, base_tags)
+    hashtag_line = " ".join(f"#{t}" for t in all_tags[:8])
+    description = f"{title}\n\nSubscribe for a new video every single day!\n\n{hashtag_line}"
+
+    video_id = upload_to_youtube(output_path, title, description, all_tags)
     update_tracker(video_id, title, content_type)
 
 
