@@ -2,7 +2,7 @@ name: Daily YouTube Shorts Upload
 
 on:
   schedule:
-    - cron: "0 0,6,12,18 * * *"   # runs 4 times a day, every 6 hours (UTC)
+    - cron: "0 */4 * * *"   # runs 6 times a day, every 4 hours (UTC)
   workflow_dispatch:
 
 jobs:
