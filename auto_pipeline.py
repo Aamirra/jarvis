@@ -24,7 +24,8 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
 WIDTH, HEIGHT = 1080, 1920
-TARGET_DURATION = 60.0  # final video will always be exactly this long
+MIN_DURATION = 30.0
+MAX_DURATION = 40.0  # each video's final length is picked randomly between these
 PEXELS_KEY = os.environ.get("PEXELS_API_KEY")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 GEMINI_MODEL = "gemini-3.1-flash-lite"  # cheap + fast, plenty for short scripts
@@ -32,56 +33,104 @@ GEMINI_MODEL = "gemini-3.1-flash-lite"  # cheap + fast, plenty for short scripts
 TRACKER_FILE = "upload_tracker.json"
 MUSIC_DIR = "music"  # put a few royalty-free .mp3 files here; one is picked at random each run
 
-# Font used for on-screen captions (installed via apt in the workflow: fonts-dejavu-core)
+# Font used for on-screen captions (installed via apt in the workflow: fonts-dejavu-core).
+# Captions are always shown in Latin/Roman script (English, or Roman Urdu) so
+# one font covers both languages - no extra font file needed.
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
-CTA_SCENE = {
+# 6 runs per day, one every 4 hours (UTC), split 3 English / 3 Urdu and evenly
+# across both content types. Update your workflow's cron to '0 */4 * * *' so
+# it actually triggers at these hours.
+RUN_SCHEDULE = {
+    0: ("random", "en"),
+    4: ("ai_tips", "ur"),
+    8: ("random", "ur"),
+    12: ("ai_tips", "en"),
+    16: ("random", "en"),
+    20: ("ai_tips", "ur"),
+}
+
+
+def get_run_config():
+    """Decide today's content type + language from the UTC hour. Snaps to the
+    nearest scheduled hour so a slightly delayed workflow run (common with
+    GitHub Actions cron) still picks a sensible slot instead of crashing."""
+    hour = datetime.now(timezone.utc).hour
+    closest_hour = min(RUN_SCHEDULE.keys(), key=lambda h: min(abs(hour - h), 24 - abs(hour - h)))
+    return RUN_SCHEDULE[closest_hour]
+
+
+# Urdu runs: "text" stays in proper Urdu script because gTTS needs real Urdu
+# script to pronounce it correctly - that field is only ever used for the
+# voice-over, never shown on screen. "caption" is Roman Urdu, so anyone can
+# read the on-screen text, not just people who read the Urdu script.
+CTA_SCENE_EN = {
     "text": "If this blew your mind, hit that subscribe button and turn on notifications, because we post brand new videos every single day.",
     "query": "colorful nebula space bright",
     "cta": True,
     "caption": "SUBSCRIBE FOR MORE!",
 }
 
+CTA_SCENE_UR = {
+    "text": "اگر یہ ویڈیو پسند آئی تو سبسکرائب کریں اور نوٹیفکیشن آن کریں، کیونکہ ہم روزانہ نئی ویڈیوز پوسٹ کرتے ہیں۔",
+    "query": "colorful nebula space bright",
+    "cta": True,
+    "caption": "SUBSCRIBE KAREIN!",
+}
+
 # Used only if AI script generation fails, so the pipeline never crashes.
 FALLBACK_SCRIPTS = {
     "random": {
-        "title": "Space is Completely Silent",
-        "hashtags": ["space", "facts", "didyouknow", "science", "universe"],
-        "scenes": [
-            {"text": "Did you know that space is completely silent?", "query": "deep space cosmos silence"},
-            {"text": "Sound waves require a medium like air to travel, and because space is a vacuum, molecules are too far apart to carry sound.", "query": "space vacuum stars"},
-            {"text": "If you screamed in space, no one would hear you.", "query": "astronaut floating space"},
-            {"text": "This eerie silence stretches across the entire universe, making the cosmos both breathtaking and strangely terrifying.", "query": "galaxy spinning nebula"},
-            {"text": "Planets, stars, and galaxies move in complete quiet, hidden behind the vastness of interstellar dark matter.", "query": "planet orbiting space dark"},
-        ],
+        "en": {
+            "title": "Space is Completely Silent",
+            "hashtags": ["space", "facts", "didyouknow", "science", "universe"],
+            "scenes": [
+                {"text": "Did you know that space is completely silent?", "query": "deep space cosmos silence"},
+                {"text": "Sound waves require a medium like air to travel, and because space is a vacuum, molecules are too far apart to carry sound.", "query": "space vacuum stars"},
+                {"text": "If you screamed in space, no one would hear you.", "query": "astronaut floating space"},
+                {"text": "This eerie silence stretches across the entire universe, making the cosmos both breathtaking and strangely terrifying.", "query": "galaxy spinning nebula"},
+            ],
+        },
+        "ur": {
+            "title": "Space Mein Mukammal Khamoshi Hoti Hai",
+            "hashtags": ["space", "facts", "didyouknow", "science", "universe"],
+            "scenes": [
+                {"text": "کیا آپ جانتے ہیں کہ خلا میں مکمل خاموشی ہوتی ہے؟", "caption_roman": "Kya aap jantay hain ke khala mein mukammal khamoshi hoti hai?", "query": "deep space cosmos silence"},
+                {"text": "آواز کی لہروں کو سفر کے لیے ہوا جیسے میڈیم کی ضرورت ہوتی ہے، اور چونکہ خلا ایک خلا ہے، اس لیے ذرات ایک دوسرے سے بہت دور ہوتے ہیں۔", "caption_roman": "Awaz ki lehron ko safar ke liye hawa jaisay medium ki zaroorat hoti hai, aur chunke khala aik khala hai, is liye zarrat aik dosray se bohat door hotay hain.", "query": "space vacuum stars"},
+                {"text": "اگر آپ خلا میں چیخیں تو کوئی نہیں سنے گا۔", "caption_roman": "Agar aap khala mein cheekhein to koi nahi sunega.", "query": "astronaut floating space"},
+                {"text": "یہ پراسرار خاموشی پوری کائنات میں پھیلی ہوئی ہے، جو کائنات کو خوبصورت اور عجیب طور پر خوفناک دونوں بناتی ہے۔", "caption_roman": "Ye pur-israr khamoshi puri kayenat mein phaili hui hai, jo kayenat ko khoobsurat aur ajeeb tarah se khaufnak dono banati hai.", "query": "galaxy spinning nebula"},
+            ],
+        },
     },
     "ai_tips": {
-        "title": "This One Prompt Trick Changes Everything",
-        "hashtags": ["ai", "aitips", "chatgpt", "prompting", "productivity"],
-        "scenes": [
-            {"text": "Most people use AI chatbots completely wrong, and it's costing them much better answers.", "query": "person typing laptop screen"},
-            {"text": "Here's a simple trick: instead of just asking a question, show the AI an example of what you want first.", "query": "hands typing keyboard closeup"},
-            {"text": "This is called few shot prompting, and it works because AI learns better from examples than from instructions alone.", "query": "digital technology abstract lights"},
-            {"text": "For example, instead of asking for a good title, show it two titles you already like, then ask for a third in that same style.", "query": "notebook writing ideas desk"},
-            {"text": "Try this in your very next chat with any AI tool, and watch how much better the answer gets.", "query": "smartphone chat app screen"},
-        ],
+        "en": {
+            "title": "This One Prompt Trick Changes Everything",
+            "hashtags": ["ai", "aitips", "chatgpt", "prompting", "productivity"],
+            "scenes": [
+                {"text": "Most people use AI chatbots completely wrong, and it's costing them much better answers.", "query": "person typing laptop screen"},
+                {"text": "Here's a simple trick: instead of just asking a question, show the AI an example of what you want first.", "query": "hands typing keyboard closeup"},
+                {"text": "This is called few shot prompting, and it works because AI learns better from examples than from instructions alone.", "query": "digital technology abstract lights"},
+                {"text": "Try this in your very next chat with any AI tool, and watch how much better the answer gets.", "query": "smartphone chat app screen"},
+            ],
+        },
+        "ur": {
+            "title": "Ye Aik Trick AI Istemal Karne Ka Tareeqa Badal Degi",
+            "hashtags": ["ai", "aitips", "chatgpt", "prompting", "productivity"],
+            "scenes": [
+                {"text": "زیادہ تر لوگ AI چیٹ بوٹس کا غلط استعمال کرتے ہیں، اور اس کی وجہ سے انہیں بہتر جوابات نہیں ملتے۔", "caption_roman": "Ziyada tar log AI chatbots ka ghalat istemal kartay hain, aur is ki wajah se unhein behtar jawabat nahi miltay.", "query": "person typing laptop screen"},
+                {"text": "یہ آسان ترکیب آزمائیں: صرف سوال پوچھنے کے بجائے، پہلے AI کو ایک مثال دکھائیں کہ آپ کیا چاہتے ہیں۔", "caption_roman": "Ye aasan trick azmayein: sirf sawaal poochne ke bajaye, pehlay AI ko aik misaal dikhayein ke aap kya chahtay hain.", "query": "hands typing keyboard closeup"},
+                {"text": "اسے فیو شاٹ پرامپٹنگ کہتے ہیں، اور یہ اس لیے کام کرتا ہے کیونکہ AI مثالوں سے ہدایات کی نسبت بہتر سیکھتا ہے۔", "caption_roman": "Isay few-shot prompting kehtay hain, aur ye is liye kaam karta hai kyunke AI misaalon se hidayaat ki nisbat behtar seekhta hai.", "query": "digital technology abstract lights"},
+                {"text": "اپنی اگلی چیٹ میں یہ ضرور آزمائیں اور دیکھیں جواب کتنا بہتر ملتا ہے۔", "caption_roman": "Apni agli chat mein ye zaroor azmayein aur dekhein jawab kitna behtar milta hai.", "query": "smartphone chat app screen"},
+            ],
+        },
     },
 }
 
 
-def choose_content_type():
-    """Decide today's content type from the UTC hour, so the 4 daily runs
-    (every 6 hours) split evenly into 2 random-topic videos and 2 AI-tips
-    videos without needing any extra state file."""
-    hour = datetime.now(timezone.utc).hour
-    if hour in (6, 18):
-        return "ai_tips"
-    return "random"  # covers hour 0, 12, and any manual/off-schedule run
-
-
-def get_past_titles(limit=20):
-    """Read titles of previously uploaded videos so we can ask the AI to
-    avoid repeating the same topic."""
+def get_past_titles(language, limit=20):
+    """Read titles of previously uploaded videos in the same language, so we
+    can ask the AI to avoid repeating the same topic. Older tracker entries
+    saved before language tracking was added are treated as English."""
     if not os.path.exists(TRACKER_FILE):
         return []
     try:
@@ -89,46 +138,72 @@ def get_past_titles(limit=20):
             data = json.load(f)
         if not isinstance(data, list):
             return []
-        return [entry.get("title", "") for entry in data[-limit:] if entry.get("title")]
+        matching = [e for e in data if e.get("language", "en") == language]
+        return [entry.get("title", "") for entry in matching[-limit:] if entry.get("title")]
     except Exception:
         return []
 
 
-def build_prompt(content_type, avoid_text):
-    if content_type == "ai_tips":
-        return f"""You write short, punchy scripts for a YouTube Shorts channel
+def build_prompt(content_type, avoid_text, language):
+    topic_rules_ai = """- 4 to 6 scenes total.
+- Teach ONE genuinely useful, concrete AI tip, trick, or concept per video (e.g. a prompting technique, a way to save time, a common mistake to avoid, or a simple explanation of how AI works).
+- All scenes combined should read aloud in about 22-30 seconds (roughly 60-85 words total).
+- The very first sentence must be a bold, scroll-stopping hook - a surprising claim, mistake, or question - written to stop someone mid-scroll in the first 2 seconds. Then explain the tip clearly, then give one short concrete example.
+- Each "query" must describe generic, vivid, specific stock video footage (people using devices, offices, technology, abstract digital visuals) - never named apps' logos or real people - so it closely matches the sentence and can be found on a stock footage site.
+- hashtags should mix a couple of broad/high-traffic tags (like "ai", "shorts") with a few specific to this exact tip, to help discovery."""
+
+    topic_rules_random = """- 4 to 6 scenes total.
+- All scenes combined should read aloud in about 22-30 seconds (roughly 60-85 words total).
+- The very first sentence must be a bold, scroll-stopping hook - a surprising claim or question - written to stop someone mid-scroll in the first 2 seconds. Then the rest should flow like a mini story with build-up and a surprising payoff.
+- Each "query" must describe generic, vivid, specific stock video footage (nature, objects, places, animals) - never named people or brands - so it closely matches the sentence and can be found on a stock footage site.
+- hashtags should mix a couple of broad/high-traffic tags (like "shorts", "facts") with a few specific to this exact topic, to help discovery."""
+
+    topic_context = (
+        """You write short, punchy scripts for a YouTube Shorts channel
 that teaches everyday people practical AI tips, tricks, and beginner concepts
 for using AI chatbots and tools (like ChatGPT, Gemini, Claude, or similar) in
 daily life, work, or study. Assume the viewer is a curious beginner, not a
-programmer.
+programmer."""
+        if content_type == "ai_tips" else
+        """You write short, punchy scripts for a "did you know" style
+YouTube Shorts channel about surprising true facts (space, science, history,
+psychology, nature, animals, or the human body - pick ONE topic at random,
+something genuinely surprising and different each time)."""
+    )
+    topic_rules = topic_rules_ai if content_type == "ai_tips" else topic_rules_random
+
+    if language == "ur":
+        return f"""{topic_context}
 
 {avoid_text}
 
+IMPORTANT - this video is for Urdu-speaking viewers, but captions must be
+readable by anyone, including Hindi speakers who don't read the Urdu script:
+- "title": a short, catchy title written in ROMAN URDU (Urdu typed with English/Latin letters, the way most people type Urdu on WhatsApp/Instagram) - NOT Urdu script, NOT Hindi Devanagari.
+- "text" (per scene): the SAME sentence written in proper URDU SCRIPT (Nastaliq/Arabic script). This is used only to generate the voice-over, so it must be correct, natural Urdu script for the voice to sound right - it is never shown on screen.
+- "caption_roman" (per scene): the SAME sentence transliterated into ROMAN URDU. This is what actually appears as the on-screen caption.
+- "query": in English only, used to search English-language stock footage.
+- "hashtags": in English, lowercase.
+
 Return ONLY valid JSON in exactly this shape, no extra commentary:
 {{
-  "title": "a short catchy title for the video, under 8 words",
-  "hashtags": ["5 to 8 relevant lowercase hashtags for this specific video, no # symbol"],
+  "title": "short catchy title in Roman Urdu, under 8 words",
+  "hashtags": ["5 to 8 relevant lowercase English hashtags, no # symbol"],
   "scenes": [
-    {{"text": "one or two spoken sentences", "query": "2-4 word English stock-footage search term for this sentence"}}
+    {{"text": "one or two spoken sentences in proper Urdu script", "caption_roman": "the same sentences in Roman Urdu", "query": "2-4 word English stock-footage search term for this sentence"}}
   ]
 }}
 
 Rules:
-- 6 to 8 scenes total.
-- Teach ONE genuinely useful, concrete AI tip, trick, or concept per video (e.g. a prompting technique, a way to save time, a common mistake to avoid, or a simple explanation of how AI works).
-- All scenes combined should read aloud in about 40-45 seconds (roughly 110-140 words total).
-- Start with a hook about a mistake or surprising fact, then explain the tip clearly, then give one short concrete example.
-- Each "query" must describe generic stock video footage (people using devices, offices, technology, abstract digital visuals) - never named apps' logos or real people - so it can be found on a stock footage site.
-- hashtags should mix a couple of broad/high-traffic tags (like "ai", "shorts") with a few specific to this exact tip, to help discovery.
+{topic_rules}
 - Keep language simple, practical, and conversational, suitable for text-to-speech narration.
 """
     else:
-        return f"""You write short, punchy scripts for a "did you know" style
-YouTube Shorts channel about surprising true facts (space, science, history,
-psychology, nature, animals, or the human body - pick ONE topic at random,
-something genuinely surprising and different each time).
+        return f"""{topic_context}
 
 {avoid_text}
+
+Write the "title" and every scene's "text" in English.
 
 Return ONLY valid JSON in exactly this shape, no extra commentary:
 {{
@@ -140,21 +215,17 @@ Return ONLY valid JSON in exactly this shape, no extra commentary:
 }}
 
 Rules:
-- 6 to 8 scenes total.
-- All scenes combined should read aloud in about 40-45 seconds (roughly 110-140 words total).
-- Each scene's spoken text should flow into the next like a mini story with a hook, build-up, and a surprising payoff.
-- Each "query" must describe generic stock video footage (nature, objects, places, animals) - never named people or brands - so it can be found on a stock footage site.
-- hashtags should mix a couple of broad/high-traffic tags (like "shorts", "facts") with a few specific to this exact topic, to help discovery.
-- Keep language simple and conversational, suitable for text-to-speech narration.
+{topic_rules}
+- Keep language simple, practical, and conversational, suitable for text-to-speech narration.
 """
 
 
-def generate_script_with_ai(content_type, max_attempts=3):
+def generate_script_with_ai(content_type, language, max_attempts=3):
     if not GEMINI_KEY:
         print("GEMINI_API_KEY not set, using fallback script.")
-        return FALLBACK_SCRIPTS[content_type]
+        return FALLBACK_SCRIPTS[content_type][language]
 
-    past_titles = get_past_titles()
+    past_titles = get_past_titles(language)
     avoid_text = ""
     if past_titles:
         avoid_text = (
@@ -162,13 +233,13 @@ def generate_script_with_ai(content_type, max_attempts=3):
             + "; ".join(past_titles)
         )
 
-    prompt = build_prompt(content_type, avoid_text)
+    prompt = build_prompt(content_type, avoid_text, language)
 
     try:
         client = genai.Client(api_key=GEMINI_KEY)
     except Exception as e:
         print(f"Could not create Gemini client, using fallback script: {type(e).__name__}: {e}")
-        return FALLBACK_SCRIPTS[content_type]
+        return FALLBACK_SCRIPTS[content_type][language]
 
     last_error = None
     for attempt in range(1, max_attempts + 1):
@@ -199,6 +270,8 @@ def generate_script_with_ai(content_type, max_attempts=3):
             for scene in data["scenes"]:
                 if not scene.get("text") or not scene.get("query"):
                     raise ValueError("A scene in the AI response is missing 'text' or 'query'.")
+                if language == "ur" and not scene.get("caption_roman"):
+                    raise ValueError("A scene in the AI response is missing 'caption_roman'.")
 
             print(f"Gemini script generated successfully on attempt {attempt}/{max_attempts}.")
             return data
@@ -210,7 +283,24 @@ def generate_script_with_ai(content_type, max_attempts=3):
                 time.sleep(3 * attempt)  # brief backoff before retrying
 
     print(f"All {max_attempts} Gemini attempts failed, using fallback script. Last error: {last_error}")
-    return FALLBACK_SCRIPTS[content_type]
+    return FALLBACK_SCRIPTS[content_type][language]
+
+
+def apply_zoom(clip, duration, zoom_ratio=0.15):
+    """Subtle Ken Burns style zoom-in over the clip's duration, so the
+    background feels alive instead of a static shot. Cheap production-value
+    boost, no extra API/cost involved."""
+    try:
+        def zoom_factor(t):
+            return 1 + zoom_ratio * (t / duration)
+
+        zoomed = clip.resized(zoom_factor)
+        return CompositeVideoClip(
+            [zoomed.with_position("center")], size=(WIDTH, HEIGHT)
+        ).with_duration(duration)
+    except Exception as e:
+        print(f"Zoom effect failed, using plain clip: {e}")
+        return clip
 
 
 def fetch_clip(query, duration_needed, index):
@@ -239,7 +329,8 @@ def fetch_clip(query, duration_needed, index):
                 while cur_dur < duration_needed:
                     clips_list.append(clip)
                     cur_dur += clip.duration
-                return concatenate_videoclips(clips_list).subclipped(0, duration_needed)
+                final_clip = concatenate_videoclips(clips_list).subclipped(0, duration_needed)
+                return apply_zoom(final_clip, duration_needed)
             else:
                 print(f"Pexels returned status {resp.status_code} for query '{query}': {resp.text[:200]}")
         except Exception as e:
@@ -249,24 +340,33 @@ def fetch_clip(query, duration_needed, index):
     return ImageClip(np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)).with_duration(duration_needed)
 
 
-def add_caption(bg_clip, caption_text, duration, is_cta=False):
-    """Overlay on-screen caption text on top of a background clip. Falls back
-    to the plain background clip if caption rendering fails for any reason,
-    so the pipeline never crashes just because of a font/text issue."""
+def add_caption(bg_clip, caption_text, duration, is_cta=False, chunk_words=4):
+    """Split the caption into short chunks (a few words each) that appear one
+    after another in sync with the scene's audio - a fast-paced style common
+    on high-performing Shorts, instead of one long static sentence sitting on
+    screen the whole time. Falls back to the plain background clip if caption
+    rendering fails for any reason, so the pipeline never crashes."""
     try:
-        caption = TextClip(
-            font=FONT_PATH,
-            text=caption_text,
-            font_size=72 if is_cta else 58,
-            color="yellow" if is_cta else "white",
-            stroke_color="black",
-            stroke_width=3 if is_cta else 2,
-            method="caption",
-            size=(int(WIDTH * 0.85), None),
-            text_align="center",
-        ).with_duration(duration).with_position(("center", int(HEIGHT * 0.72)))
+        words = caption_text.split()
+        chunks = [" ".join(words[i:i + chunk_words]) for i in range(0, len(words), chunk_words)] or [caption_text]
+        chunk_duration = duration / len(chunks)
 
-        return CompositeVideoClip([bg_clip, caption], size=(WIDTH, HEIGHT)).with_duration(duration)
+        caption_clips = []
+        for idx, chunk in enumerate(chunks):
+            txt_clip = TextClip(
+                font=FONT_PATH,
+                text=chunk,
+                font_size=72 if is_cta else 62,
+                color="yellow" if is_cta else "white",
+                stroke_color="black",
+                stroke_width=3 if is_cta else 2,
+                method="caption",
+                size=(int(WIDTH * 0.85), None),
+                text_align="center",
+            ).with_duration(chunk_duration).with_start(idx * chunk_duration).with_position(("center", int(HEIGHT * 0.72)))
+            caption_clips.append(txt_clip)
+
+        return CompositeVideoClip([bg_clip] + caption_clips, size=(WIDTH, HEIGHT)).with_duration(duration)
     except Exception as e:
         print(f"Caption failed for text '{caption_text[:30]}...': {e}")
         return bg_clip
@@ -393,7 +493,7 @@ def upload_to_youtube(video_path, title, description, tags):
     return video_id
 
 
-def update_tracker(video_id, title, content_type):
+def update_tracker(video_id, title, content_type, language):
     data = []
     if os.path.exists(TRACKER_FILE):
         try:
@@ -408,6 +508,7 @@ def update_tracker(video_id, title, content_type):
         "video_id": video_id,
         "title": title,
         "content_type": content_type,
+        "language": language,
         "uploaded_at": datetime.now(timezone.utc).isoformat(),
         "url": f"https://youtube.com/shorts/{video_id}",
     })
@@ -417,23 +518,28 @@ def update_tracker(video_id, title, content_type):
 
 
 def generate_video():
-    content_type = choose_content_type()
-    script = generate_script_with_ai(content_type)
-    title = script["title"]
-    scenes = list(script["scenes"]) + [CTA_SCENE]
+    target_duration = round(random.uniform(MIN_DURATION, MAX_DURATION), 1)
+    content_type, language = get_run_config()
 
-    print(f"Content type: {content_type} | Today's topic: {title}")
+    script = generate_script_with_ai(content_type, language)
+    title = script["title"]  # already Roman Urdu for ur runs, English for en runs
+    cta_scene = CTA_SCENE_UR if language == "ur" else CTA_SCENE_EN
+    scenes = list(script["scenes"]) + [cta_scene]
+    tts_lang = "ur" if language == "ur" else "en"
+
+    print(f"Content type: {content_type} | Language: {language} | Topic: {title} | Target duration: {target_duration}s")
 
     audio_clips = []
     video_clips = []
     for i, scene in enumerate(scenes):
         fname = f"part_{i}.mp3"
-        gTTS(text=scene["text"], lang="en").save(fname)
+        gTTS(text=scene["text"], lang=tts_lang).save(fname)  # "text" is always proper-script for correct pronunciation
         aclip = AudioFileClip(fname)
         audio_clips.append(aclip)
 
         bg_clip = fetch_clip(scene["query"], aclip.duration, i)
-        caption_text = scene.get("caption", scene["text"])
+        # on-screen caption: explicit "caption" (CTA) > "caption_roman" (Urdu scenes) > "text" (English scenes)
+        caption_text = scene.get("caption") or scene.get("caption_roman") or scene["text"]
         scene_clip = add_caption(bg_clip, caption_text, aclip.duration, is_cta=scene.get("cta", False))
         if i == 0:
             scene_clip = add_title_flash(scene_clip, title)
@@ -444,11 +550,11 @@ def generate_video():
 
     current_duration = min(final_audio.duration, final_video.duration)
 
-    if current_duration > TARGET_DURATION:
-        final_audio = final_audio.subclipped(0, TARGET_DURATION)
-        final_video = final_video.subclipped(0, TARGET_DURATION)
-    elif current_duration < TARGET_DURATION:
-        pad = TARGET_DURATION - current_duration
+    if current_duration > target_duration:
+        final_audio = final_audio.subclipped(0, target_duration)
+        final_video = final_video.subclipped(0, target_duration)
+    elif current_duration < target_duration:
+        pad = target_duration - current_duration
         silence = AudioClip(lambda t: 0, duration=pad, fps=44100)
         final_audio = concatenate_audioclips([final_audio, silence])
 
@@ -475,10 +581,14 @@ def generate_video():
     all_tags = list(dict.fromkeys(ai_hashtags + base_tags))  # AI's topic-specific tags first, deduped
 
     hashtag_line = " ".join(f"#{t}" for t in all_tags[:8])
-    description = f"{title}\n\nSubscribe for a new video every single day!\n\n{hashtag_line}"
+    subscribe_line = (
+        "Rozana nayi video ke liye subscribe karein!" if language == "ur"
+        else "Subscribe for a new video every single day!"
+    )
+    description = f"{title}\n\n{subscribe_line}\n\n{hashtag_line}"
 
     video_id = upload_to_youtube(output_path, title, description, all_tags)
-    update_tracker(video_id, title, content_type)
+    update_tracker(video_id, title, content_type, language)
 
 
 if __name__ == "__main__":
