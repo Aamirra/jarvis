@@ -34,9 +34,15 @@ TEXT_MODEL = "gemini-2.5-flash"  # trend research + story writing (free tier is 
 # Cartoon images come from Pollinations' free, keyless image endpoint instead
 # of a paid/rate-limited Gemini image model. No API key, no daily quota - the
 # only rule is roughly one request every 15 seconds on the anonymous tier, so
-# generate_cartoon_image() paces itself automatically.
+# generate_cartoon_image() paces itself after every request, success or not.
 POLLINATIONS_URL = "https://image.pollinations.ai/prompt/{prompt}"
 POLLINATIONS_PACING_SECONDS = 15
+
+# How much bigger than the final frame each scene image is generated, so
+# build_ken_burns_clip() has real room to pan/zoom across it without ever
+# revealing an edge of the source image.
+PAN_MARGIN = 0.25
+KEN_BURNS_ZOOM_RATIO = 0.22  # how much extra zoom is added over a scene's duration
 
 TRACKER_FILE = "cartoon_upload_tracker.json"
 MUSIC_DIR = "music"  # put a few royalty-free .mp3 files here; one is picked at random each run
@@ -82,8 +88,18 @@ CTA_SCENE_UR = {
     "caption": "SUBSCRIBE KAREIN!",
 }
 
+# The 3 visual beats used for the CTA scene's little wave animation
+# (start / middle / end), same idea as the AI-written scenes below.
+CTA_IMAGE_BEATS = [
+    "the character starting to raise one hand up, big happy smile, beginning to wave at the viewer",
+    "the character mid-wave with an even bigger smile, a few sparkle icons starting to appear around them",
+    "the character giving one big enthusiastic wave at the viewer, surrounded by a sparkle of subscribe/bell/like icons",
+]
+
 # Used only if AI script generation fails completely, so the pipeline never
 # crashes. One safe, original (non-copyrighted) space/galaxy cartoon story.
+# Each scene has 3 "image_prompts" beats (start/middle/end) so it animates
+# the same way an AI-written scene would.
 FALLBACK_SCRIPT = {
     "en": {
         "title": "Orbit The Planet Makes New Friends",
@@ -91,13 +107,29 @@ FALLBACK_SCRIPT = {
         "character_sheet": "A small round planet character with big friendly eyes, a soft pastel blue-green surface with gentle swirl patterns, a tiny ring like a scarf, cute expressive smiling face, flat 2D cartoon style",
         "scenes": [
             {"text": "Orbit the little planet spun alone in his corner of the galaxy, wishing he had someone to shine with.",
-             "image_prompt": "the small round planet character floating alone among distant twinkling stars, soft light pastel galaxy background"},
+             "image_prompts": [
+                 "the small round planet character floating alone at the edge of a quiet galaxy, distant twinkling stars, soft light pastel background",
+                 "the planet character slowly drifting further, looking around hopefully but seeing no one nearby, soft pastel space background",
+                 "the planet character sighing softly, a single little star twinkling faintly in the distance, light pastel colors",
+             ]},
             {"text": "One day a friendly comet zoomed by and invited Orbit to visit the sparkling star cluster nearby.",
-             "image_prompt": "a cheerful comet with a colorful pastel tail flying beside the planet character, light bright space background"},
+             "image_prompts": [
+                 "a cheerful comet with a colorful pastel tail zooming into view near the planet character, light bright space background",
+                 "the comet circling playfully around the planet character with an inviting gesture, bright pastel colors",
+                 "the planet character smiling and starting to follow the comet toward a distant sparkling star cluster, light pastel background",
+             ]},
             {"text": "At the star cluster, dozens of twinkling stars welcomed Orbit and taught him how to glow even brighter.",
-             "image_prompt": "the planet character surrounded by smiling twinkling stars, everyone glowing warmly, bright pastel colors"},
+             "image_prompts": [
+                 "the planet character arriving at a cluster of twinkling stars, the stars turning to look at them warmly, bright pastel colors",
+                 "the twinkling stars gathering closer around the planet character with teaching gestures, everyone glowing softly, light pastel background",
+                 "the planet character glowing brighter than before, surrounded by smiling stars, warm bright pastel colors",
+             ]},
             {"text": "Now Orbit lights up the whole galaxy with his new friends, and space never feels lonely again.",
-             "image_prompt": "the planet character and star friends together forming a bright colorful galaxy, joyful celebration, sunny pastel colors"},
+             "image_prompts": [
+                 "the planet character and star friends starting to line up together across the sky, bright pastel colors",
+                 "the planet character and stars glowing together, forming a colorful trail across the galaxy, sunny pastel colors",
+                 "the whole galaxy lit up brightly with the planet character and star friends celebrating together, joyful sunny pastel colors",
+             ]},
         ],
     },
     "ur": {
@@ -107,16 +139,32 @@ FALLBACK_SCRIPT = {
         "scenes": [
             {"text": "اوربٹ، ایک چھوٹا سا سیارہ، کہکشاں کے ایک کونے میں اکیلا گھومتا تھا اور چاہتا تھا کہ اس کے ساتھ کوئی چمکے۔",
              "caption_roman": "Orbit, aik chota sa sayyara, kehkashan ke aik kone mein akela ghoomta tha aur chahta tha ke uske sath koi chamke.",
-             "image_prompt": "the small round planet character floating alone among distant twinkling stars, soft light pastel galaxy background"},
+             "image_prompts": [
+                 "the small round planet character floating alone at the edge of a quiet galaxy, distant twinkling stars, soft light pastel background",
+                 "the planet character slowly drifting further, looking around hopefully but seeing no one nearby, soft pastel space background",
+                 "the planet character sighing softly, a single little star twinkling faintly in the distance, light pastel colors",
+             ]},
             {"text": "ایک دن ایک دوستانہ دم دار ستارہ اس کے پاس سے گزرا اور اسے قریبی چمکتے ستاروں کے جھرمٹ میں آنے کی دعوت دی۔",
              "caption_roman": "Aik din aik dostana dumdar sitara uske pass se guzra aur usay qareebi chamakte sitaron ke jhurmat mein aane ki dawat di.",
-             "image_prompt": "a cheerful comet with a colorful pastel tail flying beside the planet character, light bright space background"},
+             "image_prompts": [
+                 "a cheerful comet with a colorful pastel tail zooming into view near the planet character, light bright space background",
+                 "the comet circling playfully around the planet character with an inviting gesture, bright pastel colors",
+                 "the planet character smiling and starting to follow the comet toward a distant sparkling star cluster, light pastel background",
+             ]},
             {"text": "ستاروں کے جھرمٹ میں درجنوں چمکتے ستاروں نے اوربٹ کا استقبال کیا اور اسے مزید چمکنا سکھایا۔",
              "caption_roman": "Sitaron ke jhurmat mein darjanon chamakte sitaron ne Orbit ka istaqbal kiya aur usay mazeed chamakna sikhaya.",
-             "image_prompt": "the planet character surrounded by smiling twinkling stars, everyone glowing warmly, bright pastel colors"},
+             "image_prompts": [
+                 "the planet character arriving at a cluster of twinkling stars, the stars turning to look at them warmly, bright pastel colors",
+                 "the twinkling stars gathering closer around the planet character with teaching gestures, everyone glowing softly, light pastel background",
+                 "the planet character glowing brighter than before, surrounded by smiling stars, warm bright pastel colors",
+             ]},
             {"text": "اب اوربٹ اپنے نئے دوستوں کے ساتھ پوری کہکشاں کو روشن کرتا ہے، اور خلا کبھی تنہا محسوس نہیں ہوتا۔",
              "caption_roman": "Ab Orbit apne naye doston ke sath puri kehkashan ko roshan karta hai, aur khala kabhi tanha mehsoos nahi hota.",
-             "image_prompt": "the planet character and star friends together forming a bright colorful galaxy, joyful celebration, sunny pastel colors"},
+             "image_prompts": [
+                 "the planet character and star friends starting to line up together across the sky, bright pastel colors",
+                 "the planet character and stars glowing together, forming a colorful trail across the galaxy, sunny pastel colors",
+                 "the whole galaxy lit up brightly with the planet character and star friends celebrating together, joyful sunny pastel colors",
+             ]},
         ],
     },
 }
@@ -198,7 +246,7 @@ def build_prompt(avoid_text, trend_text, language):
 - The very first sentence must be a bold, scroll-stopping hook - a surprising situation or question about space - written to grab attention in the first 2 seconds.
 - All scenes combined should read aloud in about 22-30 seconds (roughly 60-85 words total).
 - "character_sheet": a short, vivid visual description of the character's appearance (type, colors, accessories, expression) written for an AI image generator, detailed enough to stay visually consistent scene to scene. Always written in English.
-- Each "image_prompt" should describe ONLY the action, setting, and emotion happening in that specific scene (the character's look is already handled separately) - vivid and specific, and must describe a BRIGHT, LIGHT-colored space scene (soft pastel nebula/sky, NOT a black or dark background). Always written in English.
+- Each scene needs "image_prompts": an array of EXACTLY 3 short prompts describing that scene's action as 3 distinct beats - a clear start, middle, and end of whatever happens in that scene (e.g. the character reaching out, then touching something, then reacting) - so they play like a tiny 3-frame flipbook, not 3 versions of the same static pose. Keep the setting consistent across the 3 beats, only the action/pose changes. Each beat must describe a BRIGHT, LIGHT-colored space scene (soft pastel nebula/sky, NOT a black or dark background). Always written in English.
 - hashtags should mix broad/high-traffic tags (like "cartoon", "shorts", "animation", "space") with a few specific to this exact story (e.g. a specific planet or galaxy name if relevant)."""
 
     if language == "ur":
@@ -219,7 +267,7 @@ Return ONLY valid JSON in exactly this shape, no extra commentary:
   "hashtags": ["5 to 8 relevant lowercase English hashtags, no # symbol"],
   "character_sheet": "visual description of the character, in English",
   "scenes": [
-    {{"text": "one or two spoken sentences in proper Urdu script", "caption_roman": "the same sentences in Roman Urdu", "image_prompt": "what is happening in this scene, in English"}}
+    {{"text": "one or two spoken sentences in proper Urdu script", "caption_roman": "the same sentences in Roman Urdu", "image_prompts": ["start beat, in English", "middle beat, in English", "end beat, in English"]}}
   ]
 }}
 
@@ -239,7 +287,7 @@ Return ONLY valid JSON in exactly this shape, no extra commentary:
   "hashtags": ["5 to 8 relevant lowercase hashtags for this specific story, no # symbol"],
   "character_sheet": "visual description of the character",
   "scenes": [
-    {{"text": "one or two spoken sentences", "image_prompt": "what is happening in this scene"}}
+    {{"text": "one or two spoken sentences", "image_prompts": ["start beat", "middle beat", "end beat"]}}
   ]
 }}
 
@@ -296,8 +344,10 @@ def generate_script_with_ai(language, trend_text, max_attempts=3):
             if not data.get("title") or not data.get("scenes") or not data.get("character_sheet"):
                 raise ValueError("AI response JSON is missing 'title', 'character_sheet' or 'scenes'.")
             for scene in data["scenes"]:
-                if not scene.get("text") or not scene.get("image_prompt"):
-                    raise ValueError("A scene in the AI response is missing 'text' or 'image_prompt'.")
+                if not scene.get("text") or not scene.get("image_prompts"):
+                    raise ValueError("A scene in the AI response is missing 'text' or 'image_prompts'.")
+                if not isinstance(scene["image_prompts"], list) or len(scene["image_prompts"]) < 2:
+                    raise ValueError("A scene's 'image_prompts' must be a list of at least 2 beats.")
                 if language == "ur" and not scene.get("caption_roman"):
                     raise ValueError("A scene in the AI response is missing 'caption_roman'.")
 
@@ -314,90 +364,120 @@ def generate_script_with_ai(language, trend_text, max_attempts=3):
     return FALLBACK_SCRIPT[language]
 
 
-def fit_to_portrait(img):
-    """Resize + center-crop a generated image to exactly WIDTH x HEIGHT,
-    since the image model doesn't guarantee an exact 1080x1920 output."""
+def fit_to_size(img, target_w, target_h):
+    """Resize + center-crop an image to exactly target_w x target_h,
+    since the image model doesn't guarantee an exact output size."""
     img = img.convert("RGB")
     w, h = img.size
-    scale = max(WIDTH / w, HEIGHT / h)
+    scale = max(target_w / w, target_h / h)
     new_w, new_h = int(w * scale) + 1, int(h * scale) + 1
     img = img.resize((new_w, new_h), PIL.Image.Resampling.LANCZOS)
-    x1 = (new_w - WIDTH) // 2
-    y1 = (new_h - HEIGHT) // 2
-    return img.crop((x1, y1, x1 + WIDTH, y1 + HEIGHT))
+    x1 = (new_w - target_w) // 2
+    y1 = (new_h - target_h) // 2
+    return img.crop((x1, y1, x1 + target_w, y1 + target_h))
 
 
-def generate_cartoon_image(prompt_text, index, seed):
+def generate_cartoon_image(prompt_text, index, target_w, target_h, seed):
     """Fetch one cartoon frame from Pollinations' free image endpoint (no
-    key, no signup, no daily cap). The same `seed` is reused for every scene
-    in a video, which - combined with repeating the full character
-    description in every prompt - keeps the look reasonably consistent
-    scene to scene, since this free endpoint doesn't support passing a
-    reference image the way a paid model would.
-    Falls back to a plain LIGHT frame if generation fails for any reason
-    (timeout, bad response, etc.) so the pipeline never crashes and never
-    shows a dark frame."""
-    fallback = PIL.Image.new("RGB", (WIDTH, HEIGHT), (235, 240, 255))
+    key, no signup, no daily cap) at the given size. Falls back to a plain
+    LIGHT frame if generation fails for any reason (timeout, bad response,
+    etc.) so the pipeline never crashes and never shows a dark frame.
+    Always paces itself ~15s before returning, success or fallback, since
+    the anonymous tier is shared and this now gets called several times
+    per scene."""
+    fallback = PIL.Image.new("RGB", (target_w, target_h), (235, 240, 255))
     url = POLLINATIONS_URL.format(prompt=requests.utils.quote(prompt_text))
-    params = {"width": WIDTH, "height": HEIGHT, "seed": seed, "nologo": "true"}
+    params = {"width": target_w, "height": target_h, "seed": seed, "nologo": "true"}
 
+    image = fallback
     for attempt in range(3):
         try:
             resp = requests.get(url, params=params, timeout=60)
             if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image"):
-                return PIL.Image.open(io.BytesIO(resp.content))
+                image = PIL.Image.open(io.BytesIO(resp.content))
+                break
             print(f"Pollinations returned {resp.status_code} for scene {index}: {resp.text[:150]}")
         except Exception as e:
             print(f"[Attempt {attempt+1}/3] Image fetch failed for scene {index}: {type(e).__name__}: {e}")
-        time.sleep(POLLINATIONS_PACING_SECONDS)  # anonymous tier: ~1 request per 15s
+        time.sleep(POLLINATIONS_PACING_SECONDS)
 
-    return fallback
-
-
-def generate_scene_variants(base_prompt, index, seed):
-    """Generate two closely related takes on the same scene (same seed,
-    slightly different wording) instead of one static frame. They won't
-    align pixel-perfectly - free text-to-image can't guarantee that - but
-    build_pulse_clip() blends them into a slow dissolve, which hides the
-    mismatch and reads as gentle motion instead of two random pictures."""
-    frame_a = fit_to_portrait(generate_cartoon_image(base_prompt + ", mid-expression", f"{index}a", seed))
-    frame_b = fit_to_portrait(generate_cartoon_image(base_prompt + ", slightly different expression and pose, same scene", f"{index}b", seed))
-    return frame_a, frame_b
+    time.sleep(POLLINATIONS_PACING_SECONDS)
+    return image
 
 
-def build_pulse_clip(frame_a, frame_b, duration, cycle_seconds=1.8):
-    """Cheap 'living illustration' effect: continuously dissolve between two
-    close variants of the same scene on an eased loop, so the frame never
-    looks frozen. This is the free-tier substitute for real animation."""
-    arr_a = np.array(frame_a).astype(np.float32)
-    arr_b = np.array(frame_b).astype(np.float32)
+def generate_scene_image(prompt_text, index, seed):
+    """Fetch ONE oversized image (bigger than the final WIDTH x HEIGHT by
+    PAN_MARGIN) and fit it to that oversized canvas, so build_ken_burns_clip()
+    has real room to pan/zoom across it without ever hitting an edge."""
+    src_w = int(WIDTH * (1 + PAN_MARGIN))
+    src_h = int(HEIGHT * (1 + PAN_MARGIN))
+    raw = generate_cartoon_image(prompt_text, index, src_w, src_h, seed)
+    return fit_to_size(raw, src_w, src_h)
+
+
+def _ken_burns_params(img_size):
+    """Pick a random pan/zoom trajectory for one oversized image: which
+    corner it drifts from/to, and whether it zooms in or out."""
+    src_w, src_h = img_size
+    max_dx = max(src_w - WIDTH, 1)
+    max_dy = max(src_h - HEIGHT, 1)
+    return {
+        "zoom_in": random.random() < 0.5,
+        "start": (random.uniform(0, max_dx), random.uniform(0, max_dy)),
+        "end": (random.uniform(0, max_dx), random.uniform(0, max_dy)),
+    }
+
+
+def _ken_burns_frame(img, params, progress, zoom_ratio=KEN_BURNS_ZOOM_RATIO):
+    """Render one frame of a continuous pan+zoom over `img` at the given
+    progress (0..1 through however long this image is being shown)."""
+    progress = min(max(progress, 0), 1)
+    src_w, src_h = img.size
+    zoom = 1 + zoom_ratio * (progress if params["zoom_in"] else (1 - progress))
+    crop_w = min(src_w, WIDTH / zoom)
+    crop_h = min(src_h, HEIGHT / zoom)
+    (sx, sy), (ex, ey) = params["start"], params["end"]
+    cx = sx + (ex - sx) * progress
+    cy = sy + (ey - sy) * progress
+    cx = max(0, min(cx, src_w - crop_w))
+    cy = max(0, min(cy, src_h - crop_h))
+    return img.crop((cx, cy, cx + crop_w, cy + crop_h)).resize((WIDTH, HEIGHT), PIL.Image.Resampling.LANCZOS)
+
+
+def build_ken_burns_clip(img, duration):
+    """Continuous pan + zoom over a single oversized still image."""
+    params = _ken_burns_params(img.size)
 
     def make_frame(t):
-        phase = (t % cycle_seconds) / cycle_seconds
-        blend = (1 - np.cos(2 * np.pi * phase)) / 2  # eased 0 -> 1 -> 0, so it breathes rather than flickers
-        frame = arr_a * (1 - blend) + arr_b * blend
-        return frame.astype("uint8")
+        return np.array(_ken_burns_frame(img, params, t / duration))
 
     return VideoClip(make_frame, duration=duration)
 
 
-def apply_zoom(clip, duration, zoom_ratio=0.15):
-    """Subtle Ken Burns style zoom over the still cartoon frame, so it feels
-    alive instead of a static image."""
-    try:
-        zoom_in = random.random() < 0.5
+def build_animated_scene_clip(images, duration):
+    """Crossfade continuously through several distinct AI keyframes for
+    this scene (each with its own slow pan+zoom), so the scene shows real
+    story motion - the character/action visibly changing - instead of just
+    the camera moving over one static picture."""
+    if len(images) == 1:
+        return build_ken_burns_clip(images[0], duration)
 
-        def zoom_factor(t):
-            progress = t / duration
-            return 1 + zoom_ratio * (progress if zoom_in else (1 - progress))
+    n = len(images)
+    seg_dur = duration / (n - 1)
+    params = [_ken_burns_params(img.size) for img in images]
 
-        zoomed = clip.resized(zoom_factor)
-        return CompositeVideoClip(
-            [zoomed.with_position("center")], size=(WIDTH, HEIGHT)
-        ).with_duration(duration)
-    except Exception as e:
-        print(f"Zoom effect failed, using plain clip: {e}")
-        return clip
+    def make_frame(t):
+        t = min(max(t, 0), duration - 1e-6)
+        seg = min(int(t / seg_dur), n - 2)
+        local = (t - seg * seg_dur) / seg_dur
+        blend = (1 - np.cos(np.pi * local)) / 2  # eased 0 -> 1 across the segment
+
+        frame_a = _ken_burns_frame(images[seg], params[seg], (seg + local) / (n - 1))
+        frame_b = _ken_burns_frame(images[seg + 1], params[seg + 1], (seg + 1 + local) / (n - 1))
+        arr = np.array(frame_a).astype(np.float32) * (1 - blend) + np.array(frame_b).astype(np.float32) * blend
+        return arr.astype("uint8")
+
+    return VideoClip(make_frame, duration=duration)
 
 
 def add_caption(bg_clip, caption_text, duration, is_cta=False, chunk_words=4):
@@ -602,9 +682,10 @@ def generate_video():
     if trend_text:
         print(f"Trend inspiration used:\n{trend_text}")
 
-    # Same seed for every scene in this video, so the free image endpoint
-    # renders in a consistent art style/palette across the story even
-    # without true reference-image conditioning.
+    # Same base seed for every scene in this video, so the free image
+    # endpoint stays in a consistent art style/palette across the story;
+    # each beat still gets its own offset so the 3 frames within a scene
+    # come out visibly different from each other.
     video_seed = random.randint(1, 999999)
 
     audio_clips = []
@@ -615,18 +696,15 @@ def generate_video():
         aclip = AudioFileClip(fname)
         audio_clips.append(aclip)
 
-        if scene.get("cta"):
-            img_prompt = (
-                STYLE_PREFIX + "Character: " + character_sheet + ". Scene: "
-                "the character waving cheerfully at the viewer, with a "
-                "subscribe/bell/like themed sparkle of icons in the background."
-            )
-        else:
-            img_prompt = STYLE_PREFIX + "Character: " + character_sheet + ". Scene: " + scene["image_prompt"]
+        beats = CTA_IMAGE_BEATS if scene.get("cta") else scene["image_prompts"]
 
-        frame_a, frame_b = generate_scene_variants(img_prompt, i, video_seed)
-        bg_clip = build_pulse_clip(frame_a, frame_b, aclip.duration)
-        bg_clip = apply_zoom(bg_clip, aclip.duration)
+        scene_images = []
+        for b, beat in enumerate(beats):
+            img_prompt = STYLE_PREFIX + "Character: " + character_sheet + ". Scene: " + beat
+            beat_seed = video_seed + i * 10 + b
+            scene_images.append(generate_scene_image(img_prompt, f"{i}.{b}", beat_seed))
+
+        bg_clip = build_animated_scene_clip(scene_images, aclip.duration)
 
         caption_text = scene.get("caption") or scene.get("caption_roman") or scene["text"]
         scene_clip = add_caption(bg_clip, caption_text, aclip.duration, is_cta=scene.get("cta", False))
