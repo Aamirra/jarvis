@@ -11,3 +11,4 @@ google-auth-httplib2
 requests
 numpy
 Pillow
+edge-tts
