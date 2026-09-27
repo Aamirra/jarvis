@@ -41,6 +41,10 @@ EDGE_TTS_VOICE = os.environ.get("EDGE_TTS_VOICE", "en-US-AndrewNeural")
 TRACKER_FILE = "upload_tracker.json"
 MUSIC_DIR = "music"  # put a few royalty-free .mp3 files here; one is picked at random each run
 
+# YouTube category per content type (Education fits AI tips; Science & Tech
+# fits "did you know" facts better than the old one-size-fits-all Education).
+CATEGORY_IDS = {"ai_tips": "27", "random": "28"}
+
 # Font used for on-screen captions (installed via apt in the workflow: fonts-dejavu-core).
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
@@ -227,24 +231,85 @@ def generate_script_with_ai(content_type, max_attempts=3):
     return FALLBACK_SCRIPTS[content_type]
 
 
+def score_hook(text):
+    """Cheap heuristic to rate how scroll-stopping an opening line is. Not a
+    substitute for real A/B testing, but a free way to prefer the punchier
+    of two AI-generated candidates instead of always taking the first draft."""
+    text_l = text.lower()
+    score = 0
+    if "?" in text:
+        score += 2
+    if any(ch.isdigit() for ch in text):
+        score += 2
+    power_words = [
+        "secret", "never", "always", "everyone", "nobody", "shocking",
+        "mistake", "wrong", "trick", "truth", "surprising", "insane",
+        "why", "how", "stop", "most people",
+    ]
+    score += sum(1 for w in power_words if w in text_l)
+    word_count = len(text.split())
+    if 6 <= word_count <= 16:  # a hook that's too long or too short lands worse
+        score += 1
+    return score
+
+
+def generate_best_script(content_type, candidates=2):
+    """Generate a couple of script candidates and keep the one with the
+    strongest hook (first scene's opening line), instead of settling for
+    whatever comes back on the first try. Costs one extra free-tier Gemini
+    call per video."""
+    if not GEMINI_KEY:
+        return FALLBACK_SCRIPTS[content_type]
+
+    best, best_score = None, -1
+    for _ in range(candidates):
+        data = generate_script_with_ai(content_type)
+        if data is FALLBACK_SCRIPTS[content_type]:
+            continue  # a fallback isn't a real candidate to compare
+        score = score_hook(data["scenes"][0]["text"])
+        if score > best_score:
+            best, best_score = data, score
+
+    return best if best is not None else FALLBACK_SCRIPTS[content_type]
+
+
 async def _edge_tts_save(text, voice, output_path):
+    """Save narration audio and, where available, collect per-word timing
+    from edge-tts's WordBoundary events (used to sync karaoke-style captions
+    exactly to the spoken audio). A bad/missing timing event is skipped
+    rather than failing the whole narration."""
     communicate = edge_tts.Communicate(text, voice)
-    await communicate.save(output_path)
+    word_timings = []
+    with open(output_path, "wb") as f:
+        async for chunk in communicate.stream():
+            ctype = chunk.get("type")
+            if ctype == "audio":
+                f.write(chunk["data"])
+            elif ctype == "WordBoundary":
+                try:
+                    start = chunk["offset"] / 1e7  # 100-ns units -> seconds
+                    dur = chunk["duration"] / 1e7
+                    word_timings.append({"text": chunk["text"], "start": start, "end": start + dur})
+                except Exception:
+                    pass  # timing is a nice-to-have; don't let a bad entry break narration
+    return word_timings
 
 
 def synthesize_speech(text, output_path):
     """Generate the narration audio using Microsoft Edge's free neural TTS
     (via the edge-tts library) - no API key, no account, no cost, and much
-    more natural-sounding than gTTS. Falls back to gTTS automatically if
-    edge-tts fails for any reason (e.g. no internet, service hiccup), so the
-    pipeline never crashes."""
+    more natural-sounding than gTTS. Returns a list of per-word timings
+    (empty if unavailable) for karaoke-style captions. Falls back to gTTS
+    automatically if edge-tts fails for any reason (no internet, service
+    hiccup) - in that case timing is unavailable and captions fall back to
+    evenly-spaced chunks, so the pipeline never crashes."""
     try:
-        asyncio.run(_edge_tts_save(text, EDGE_TTS_VOICE, output_path))
-        return
+        return asyncio.run(_edge_tts_save(text, EDGE_TTS_VOICE, output_path))
     except Exception as e:
         print(f"edge-tts failed, falling back to gTTS: {type(e).__name__}: {e}")
 
     gTTS(text=text, lang="en").save(output_path)
+    return []
 
 
 def apply_zoom(clip, duration, zoom_ratio=0.15):
@@ -264,68 +329,133 @@ def apply_zoom(clip, duration, zoom_ratio=0.15):
         return clip
 
 
-def fetch_clip(query, duration_needed, index):
+def fetch_clip(query, duration_needed, index, used_video_ids):
+    """Fetch background footage for a scene. Pulls several results per query
+    (not just the first) and splices together 2-3 different clips the video
+    hasn't already used yet - much more visually dynamic than looping a
+    single shot for the whole scene, and avoids the same footage repeating
+    across different scenes. Falls back to a blank clip if Pexels has
+    nothing usable."""
     headers = {"Authorization": PEXELS_KEY}
-    url = "https://api.pexels.com/videos/search?query=" + query + chr(38) + "per_page=1"
-    video_file = f"bg_{index}.mp4"
+    url = "https://api.pexels.com/videos/search?query=" + query + chr(38) + "per_page=6"
 
+    candidates = []
     for attempt in range(3):
         try:
             time.sleep(1)
             resp = requests.get(url, headers=headers, timeout=10)
             if resp.status_code == 200 and resp.json().get("videos"):
-                v_files = resp.json()["videos"][0]["video_files"]
-                hd_file = max(v_files, key=lambda x: x.get("width", 0))
-                with open(video_file, "wb") as vf:
-                    vf.write(requests.get(hd_file["link"], timeout=15).content)
-                clip = VideoFileClip(video_file).without_audio()
-                w, h = clip.size
-                scale = HEIGHT / h
-                new_w = int(w * scale)
-                clip = clip.resized((new_w, HEIGHT))
-                x1 = (new_w - WIDTH) // 2
-                clip = clip.cropped(x1=x1, y1=0, x2=x1 + WIDTH, y2=HEIGHT)
-                clips_list = []
-                cur_dur = 0
-                while cur_dur < duration_needed:
-                    clips_list.append(clip)
-                    cur_dur += clip.duration
-                final_clip = concatenate_videoclips(clips_list).subclipped(0, duration_needed)
-                return apply_zoom(final_clip, duration_needed)
+                candidates = resp.json()["videos"]
+                break
             else:
                 print(f"Pexels returned status {resp.status_code} for query '{query}': {resp.text[:200]}")
         except Exception as e:
             print(f"Attempt {attempt+1} failed for {query}: {e}")
             time.sleep(2)
 
-    return ImageClip(np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)).with_duration(duration_needed)
+    if not candidates:
+        return ImageClip(np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)).with_duration(duration_needed)
+
+    # Prefer clips not already used elsewhere in this video; if the query
+    # just doesn't have enough distinct results, allow reuse rather than fail.
+    fresh = [v for v in candidates if v["id"] not in used_video_ids] or candidates
+
+    # Split the scene into 2-3 different shots for a faster-paced, more
+    # dynamic feel. Skip splitting very short scenes - a cut every <2.5s
+    # looks frantic rather than dynamic.
+    max_segments = 3 if duration_needed >= 7 else (2 if duration_needed >= 4 else 1)
+    chosen = fresh[:min(max_segments, len(fresh))]
+    seg_duration = duration_needed / len(chosen)
+
+    segment_clips = []
+    for seg_idx, video in enumerate(chosen):
+        used_video_ids.add(video["id"])
+        video_file = f"bg_{index}_{seg_idx}.mp4"
+        try:
+            v_files = video["video_files"]
+            hd_file = max(v_files, key=lambda x: x.get("width", 0))
+            with open(video_file, "wb") as vf:
+                vf.write(requests.get(hd_file["link"], timeout=15).content)
+            clip = VideoFileClip(video_file).without_audio()
+            w, h = clip.size
+            scale = HEIGHT / h
+            new_w = int(w * scale)
+            clip = clip.resized((new_w, HEIGHT))
+            x1 = (new_w - WIDTH) // 2
+            clip = clip.cropped(x1=x1, y1=0, x2=x1 + WIDTH, y2=HEIGHT)
+
+            loop_clips = []
+            cur_dur = 0
+            while cur_dur < seg_duration:
+                loop_clips.append(clip)
+                cur_dur += clip.duration
+            seg_clip = concatenate_videoclips(loop_clips).subclipped(0, seg_duration)
+            segment_clips.append(apply_zoom(seg_clip, seg_duration))
+        except Exception as e:
+            print(f"Could not use clip for '{query}' segment {seg_idx}: {e}")
+
+    if not segment_clips:
+        return ImageClip(np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)).with_duration(duration_needed)
+
+    combined = concatenate_videoclips(segment_clips)
+    if combined.duration < duration_needed:  # rounding can leave a hair short
+        last_frame = combined.get_frame(max(combined.duration - 0.04, 0))
+        pad = ImageClip(last_frame).with_duration(duration_needed - combined.duration)
+        combined = concatenate_videoclips([combined, pad])
+    return combined.subclipped(0, duration_needed)
 
 
-def add_caption(bg_clip, caption_text, duration, is_cta=False, chunk_words=4):
-    """Split the caption into short chunks (a few words each) that appear one
-    after another in sync with the scene's audio - a fast-paced style common
-    on high-performing Shorts, instead of one long static sentence sitting on
-    screen the whole time. Falls back to the plain background clip if caption
-    rendering fails for any reason, so the pipeline never crashes."""
+def add_caption(bg_clip, caption_text, duration, word_timings=None, is_cta=False):
+    """Render on-screen captions. For normal scenes with word-level timing
+    from edge-tts, shows one word at a time exactly synced to the narration
+    (karaoke-style) - punchier and far better synced than a fixed-duration
+    chunk. Falls back to evenly-spaced 4-word chunks when no timing is
+    available (e.g. the gTTS fallback path), and shows the CTA line as one
+    static caption for the whole scene. Falls back to the plain background
+    clip if rendering fails for any reason, so the pipeline never crashes."""
     try:
-        words = caption_text.split()
-        chunks = [" ".join(words[i:i + chunk_words]) for i in range(0, len(words), chunk_words)] or [caption_text]
-        chunk_duration = duration / len(chunks)
-
         caption_clips = []
-        for idx, chunk in enumerate(chunks):
+
+        if is_cta:
             txt_clip = TextClip(
-                font=FONT_PATH,
-                text=chunk,
-                font_size=72 if is_cta else 62,
-                color="yellow" if is_cta else "white",
-                stroke_color="black",
-                stroke_width=3 if is_cta else 2,
-                method="caption",
-                size=(int(WIDTH * 0.85), None),
-                text_align="center",
-            ).with_duration(chunk_duration).with_start(idx * chunk_duration).with_position(("center", int(HEIGHT * 0.72)))
+                font=FONT_PATH, text=caption_text,
+                font_size=72, color="yellow",
+                stroke_color="black", stroke_width=3,
+                method="caption", size=(int(WIDTH * 0.85), None), text_align="center",
+            ).with_duration(duration).with_position(("center", int(HEIGHT * 0.72)))
             caption_clips.append(txt_clip)
+
+        elif word_timings:
+            # Karaoke-style: one word at a time, precisely timed to speech.
+            for w in word_timings:
+                start = max(0, min(w["start"], duration))
+                end = max(start, min(w["end"], duration))
+                if end <= start:
+                    continue
+                txt_clip = TextClip(
+                    font=FONT_PATH, text=w["text"].upper(),
+                    font_size=78, color="white",
+                    stroke_color="black", stroke_width=3,
+                    method="caption", size=(int(WIDTH * 0.85), None), text_align="center",
+                ).with_duration(end - start).with_start(start).with_position(("center", int(HEIGHT * 0.72)))
+                caption_clips.append(txt_clip)
+            if not caption_clips:
+                raise ValueError("No usable word timings")
+
+        else:
+            # No timing available - fall back to evenly-spaced word chunks.
+            chunk_words = 4
+            words = caption_text.split()
+            chunks = [" ".join(words[i:i + chunk_words]) for i in range(0, len(words), chunk_words)] or [caption_text]
+            chunk_duration = duration / len(chunks)
+            for idx, chunk in enumerate(chunks):
+                txt_clip = TextClip(
+                    font=FONT_PATH, text=chunk,
+                    font_size=62, color="white",
+                    stroke_color="black", stroke_width=2,
+                    method="caption", size=(int(WIDTH * 0.85), None), text_align="center",
+                ).with_duration(chunk_duration).with_start(idx * chunk_duration).with_position(("center", int(HEIGHT * 0.72)))
+                caption_clips.append(txt_clip)
 
         return CompositeVideoClip([bg_clip] + caption_clips, size=(WIDTH, HEIGHT)).with_duration(duration)
     except Exception as e:
@@ -424,7 +554,7 @@ def get_youtube_client():
     return build("youtube", "v3", credentials=creds)
 
 
-def upload_to_youtube(video_path, title, description, tags):
+def upload_to_youtube(video_path, title, description, tags, category_id="27"):
     youtube = get_youtube_client()
 
     body = {
@@ -432,7 +562,7 @@ def upload_to_youtube(video_path, title, description, tags):
             "title": title,
             "description": description,
             "tags": tags,
-            "categoryId": "27",  # Education
+            "categoryId": category_id,
         },
         "status": {
             "privacyStatus": "public",
@@ -481,23 +611,25 @@ def generate_video():
     target_duration = round(random.uniform(MIN_DURATION, MAX_DURATION), 1)
     content_type = get_run_config()
 
-    script = generate_script_with_ai(content_type)
+    script = generate_best_script(content_type)
     title = script["title"]
     scenes = list(script["scenes"]) + [CTA_SCENE]
 
     print(f"Content type: {content_type} | Topic: {title} | Target duration: {target_duration}s")
 
+    used_video_ids = set()  # avoid the same stock clip showing up twice in one video
     audio_clips = []
     video_clips = []
     for i, scene in enumerate(scenes):
         fname = f"part_{i}.mp3"
-        synthesize_speech(scene["text"], fname)
+        word_timings = synthesize_speech(scene["text"], fname)
         aclip = AudioFileClip(fname)
         audio_clips.append(aclip)
 
-        bg_clip = fetch_clip(scene["query"], aclip.duration, i)
+        bg_clip = fetch_clip(scene["query"], aclip.duration, i, used_video_ids)
+        is_cta = scene.get("cta", False)
         caption_text = scene.get("caption") or scene["text"]
-        scene_clip = add_caption(bg_clip, caption_text, aclip.duration, is_cta=scene.get("cta", False))
+        scene_clip = add_caption(bg_clip, caption_text, aclip.duration, word_timings=word_timings, is_cta=is_cta)
         if i == 0:
             scene_clip = add_title_flash(scene_clip, title)
         video_clips.append(scene_clip)
@@ -541,7 +673,7 @@ def generate_video():
     subscribe_line = "Subscribe for a new video every single day!"
     description = f"{title}\n\n{subscribe_line}\n\n{hashtag_line}"
 
-    video_id = upload_to_youtube(output_path, title, description, all_tags)
+    video_id = upload_to_youtube(output_path, title, description, all_tags, category_id=CATEGORY_IDS.get(content_type, "27"))
     update_tracker(video_id, title, content_type)
 
 
