@@ -1,17 +1,18 @@
 import os
-import io
 import json
 import random
 import time
+import asyncio
 from datetime import datetime, timezone
 
 import requests
 import numpy as np
 import PIL.Image
 if not hasattr(PIL.Image, "ANTIALIAS"): PIL.Image.ANTIALIAS = PIL.Image.Resampling.LANCZOS
-from gtts import gTTS
+import edge_tts
+from gtts import gTTS  # kept only as an emergency fallback if edge-tts fails
 from moviepy import (
-    ImageClip, VideoClip, AudioFileClip, concatenate_videoclips,
+    VideoFileClip, AudioFileClip, ImageClip, concatenate_videoclips,
     concatenate_audioclips, TextClip, CompositeVideoClip, AudioClip,
     CompositeAudioClip
 )
@@ -27,161 +28,80 @@ from googleapiclient.http import MediaFileUpload
 WIDTH, HEIGHT = 1080, 1920
 MIN_DURATION = 30.0
 MAX_DURATION = 40.0  # each video's final length is picked randomly between these
+PEXELS_KEY = os.environ.get("PEXELS_API_KEY")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
+GEMINI_MODEL = "gemini-3.1-flash-lite"  # cheap + fast, plenty for short scripts, free-tier friendly
 
-TEXT_MODEL = "gemini-2.5-flash"  # trend research + story writing (free tier is plenty for this)
+# Microsoft Edge's free neural TTS voice (no API key, no account, no cost).
+# Browse more options with: edge-tts --list-voices
+# A few good English narrator picks: en-US-AndrewNeural (male), en-US-GuyNeural
+# (male), en-US-AriaNeural (female), en-US-EmmaNeural (female).
+EDGE_TTS_VOICE = os.environ.get("EDGE_TTS_VOICE", "en-US-AndrewNeural")
 
-# Cartoon images come from Pollinations' free, keyless image endpoint instead
-# of a paid/rate-limited Gemini image model. No API key, no daily quota - the
-# only rule is roughly one request every 15 seconds on the anonymous tier, so
-# generate_cartoon_image() paces itself after every request, success or not.
-POLLINATIONS_URL = "https://image.pollinations.ai/prompt/{prompt}"
-POLLINATIONS_PACING_SECONDS = 15
-
-# How much bigger than the final frame each scene image is generated, so
-# build_ken_burns_clip() has real room to pan/zoom across it without ever
-# revealing an edge of the source image.
-PAN_MARGIN = 0.25
-KEN_BURNS_ZOOM_RATIO = 0.22  # how much extra zoom is added over a scene's duration
-
-TRACKER_FILE = "cartoon_upload_tracker.json"
+TRACKER_FILE = "upload_tracker.json"
 MUSIC_DIR = "music"  # put a few royalty-free .mp3 files here; one is picked at random each run
 
 # Font used for on-screen captions (installed via apt in the workflow: fonts-dejavu-core).
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
-# 6 runs per day, one every 4 hours (UTC), alternating English / Roman-Urdu
-# captions. Update your workflow's cron to '0 */4 * * *' so it actually
-# triggers at these hours.
+# One run every 4 hours (UTC), alternating between the two content types.
+# Update your workflow's cron to '0 */4 * * *' so it actually triggers here.
+# Want more videos per day? Add more hours below (e.g. every 2 hours for 12/day)
+# and update the cron schedule to match.
 RUN_SCHEDULE = {
-    0: "ur",
-    4: "ur",
-    8: "ur",
-    12: "ur",
-    16: "ur",
-    20: "ur",
+    0: "random",
+    4: "ai_tips",
+    8: "random",
+    12: "ai_tips",
+    16: "random",
+    20: "ai_tips",
 }
 
 
 def get_run_config():
-    """Decide today's caption language from the UTC hour. Snaps to the
-    nearest scheduled hour so a slightly delayed workflow run (common with
-    GitHub Actions cron) still picks a sensible slot instead of crashing."""
+    """Decide today's content type from the UTC hour. Snaps to the nearest
+    scheduled hour so a slightly delayed workflow run (common with GitHub
+    Actions cron) still picks a sensible slot instead of crashing."""
     hour = datetime.now(timezone.utc).hour
     closest_hour = min(RUN_SCHEDULE.keys(), key=lambda h: min(abs(hour - h), 24 - abs(hour - h)))
     return RUN_SCHEDULE[closest_hour]
 
 
-# Urdu runs: "text" stays in proper Urdu script because gTTS needs real Urdu
-# script to pronounce it correctly - that field is only ever used for the
-# voice-over, never shown on screen. "caption" is Roman Urdu, so anyone can
-# read the on-screen text, not just people who read the Urdu script.
-CTA_SCENE_EN = {
-    "text": "If you liked this story, hit subscribe and turn on notifications, because we post a brand new cartoon every single day.",
+CTA_SCENE = {
+    "text": "If this blew your mind, hit that subscribe button and turn on notifications, because we post brand new videos every single day.",
+    "query": "colorful nebula space bright",
     "cta": True,
     "caption": "SUBSCRIBE FOR MORE!",
 }
 
-CTA_SCENE_UR = {
-    "text": "اگر یہ کہانی پسند آئی تو سبسکرائب کریں اور نوٹیفکیشن آن کریں، کیونکہ ہم روزانہ نئی کارٹون ویڈیو پوسٹ کرتے ہیں۔",
-    "cta": True,
-    "caption": "SUBSCRIBE KAREIN!",
-}
-
-# The 3 visual beats used for the CTA scene's little wave animation
-# (start / middle / end), same idea as the AI-written scenes below.
-CTA_IMAGE_BEATS = [
-    "the character starting to raise one hand up, big happy smile, beginning to wave at the viewer",
-    "the character mid-wave with an even bigger smile, a few sparkle icons starting to appear around them",
-    "the character giving one big enthusiastic wave at the viewer, surrounded by a sparkle of subscribe/bell/like icons",
-]
-
-# Used only if AI script generation fails completely, so the pipeline never
-# crashes. One safe, original (non-copyrighted) space/galaxy cartoon story.
-# Each scene has 3 "image_prompts" beats (start/middle/end) so it animates
-# the same way an AI-written scene would.
-FALLBACK_SCRIPT = {
-    "en": {
-        "title": "Orbit The Planet Makes New Friends",
-        "hashtags": ["cartoon", "shorts", "animation", "space", "galaxy", "planets", "kidsstory"],
-        "character_sheet": "A small round planet character with big friendly eyes, a soft pastel blue-green surface with gentle swirl patterns, a tiny ring like a scarf, cute expressive smiling face, flat 2D cartoon style",
+# Used only if AI script generation fails, so the pipeline never crashes.
+FALLBACK_SCRIPTS = {
+    "random": {
+        "title": "Space is Completely Silent",
+        "hashtags": ["space", "facts", "didyouknow", "science", "universe"],
         "scenes": [
-            {"text": "Orbit the little planet spun alone in his corner of the galaxy, wishing he had someone to shine with.",
-             "image_prompts": [
-                 "the small round planet character floating alone at the edge of a quiet galaxy, distant twinkling stars, soft light pastel background",
-                 "the planet character slowly drifting further, looking around hopefully but seeing no one nearby, soft pastel space background",
-                 "the planet character sighing softly, a single little star twinkling faintly in the distance, light pastel colors",
-             ]},
-            {"text": "One day a friendly comet zoomed by and invited Orbit to visit the sparkling star cluster nearby.",
-             "image_prompts": [
-                 "a cheerful comet with a colorful pastel tail zooming into view near the planet character, light bright space background",
-                 "the comet circling playfully around the planet character with an inviting gesture, bright pastel colors",
-                 "the planet character smiling and starting to follow the comet toward a distant sparkling star cluster, light pastel background",
-             ]},
-            {"text": "At the star cluster, dozens of twinkling stars welcomed Orbit and taught him how to glow even brighter.",
-             "image_prompts": [
-                 "the planet character arriving at a cluster of twinkling stars, the stars turning to look at them warmly, bright pastel colors",
-                 "the twinkling stars gathering closer around the planet character with teaching gestures, everyone glowing softly, light pastel background",
-                 "the planet character glowing brighter than before, surrounded by smiling stars, warm bright pastel colors",
-             ]},
-            {"text": "Now Orbit lights up the whole galaxy with his new friends, and space never feels lonely again.",
-             "image_prompts": [
-                 "the planet character and star friends starting to line up together across the sky, bright pastel colors",
-                 "the planet character and stars glowing together, forming a colorful trail across the galaxy, sunny pastel colors",
-                 "the whole galaxy lit up brightly with the planet character and star friends celebrating together, joyful sunny pastel colors",
-             ]},
+            {"text": "Did you know that space is completely silent?", "query": "deep space cosmos silence"},
+            {"text": "Sound waves require a medium like air to travel, and because space is a vacuum, molecules are too far apart to carry sound.", "query": "space vacuum stars"},
+            {"text": "If you screamed in space, no one would hear you.", "query": "astronaut floating space"},
+            {"text": "This eerie silence stretches across the entire universe, making the cosmos both breathtaking and strangely terrifying.", "query": "galaxy spinning nebula"},
         ],
     },
-    "ur": {
-        "title": "Orbit Planet Ke Naye Dost",
-        "hashtags": ["cartoon", "shorts", "animation", "space", "galaxy", "planets", "kidsstory"],
-        "character_sheet": "A small round planet character with big friendly eyes, a soft pastel blue-green surface with gentle swirl patterns, a tiny ring like a scarf, cute expressive smiling face, flat 2D cartoon style",
+    "ai_tips": {
+        "title": "This One Prompt Trick Changes Everything",
+        "hashtags": ["ai", "aitips", "chatgpt", "prompting", "productivity"],
         "scenes": [
-            {"text": "اوربٹ، ایک چھوٹا سا سیارہ، کہکشاں کے ایک کونے میں اکیلا گھومتا تھا اور چاہتا تھا کہ اس کے ساتھ کوئی چمکے۔",
-             "caption_roman": "Orbit, aik chota sa sayyara, kehkashan ke aik kone mein akela ghoomta tha aur chahta tha ke uske sath koi chamke.",
-             "image_prompts": [
-                 "the small round planet character floating alone at the edge of a quiet galaxy, distant twinkling stars, soft light pastel background",
-                 "the planet character slowly drifting further, looking around hopefully but seeing no one nearby, soft pastel space background",
-                 "the planet character sighing softly, a single little star twinkling faintly in the distance, light pastel colors",
-             ]},
-            {"text": "ایک دن ایک دوستانہ دم دار ستارہ اس کے پاس سے گزرا اور اسے قریبی چمکتے ستاروں کے جھرمٹ میں آنے کی دعوت دی۔",
-             "caption_roman": "Aik din aik dostana dumdar sitara uske pass se guzra aur usay qareebi chamakte sitaron ke jhurmat mein aane ki dawat di.",
-             "image_prompts": [
-                 "a cheerful comet with a colorful pastel tail zooming into view near the planet character, light bright space background",
-                 "the comet circling playfully around the planet character with an inviting gesture, bright pastel colors",
-                 "the planet character smiling and starting to follow the comet toward a distant sparkling star cluster, light pastel background",
-             ]},
-            {"text": "ستاروں کے جھرمٹ میں درجنوں چمکتے ستاروں نے اوربٹ کا استقبال کیا اور اسے مزید چمکنا سکھایا۔",
-             "caption_roman": "Sitaron ke jhurmat mein darjanon chamakte sitaron ne Orbit ka istaqbal kiya aur usay mazeed chamakna sikhaya.",
-             "image_prompts": [
-                 "the planet character arriving at a cluster of twinkling stars, the stars turning to look at them warmly, bright pastel colors",
-                 "the twinkling stars gathering closer around the planet character with teaching gestures, everyone glowing softly, light pastel background",
-                 "the planet character glowing brighter than before, surrounded by smiling stars, warm bright pastel colors",
-             ]},
-            {"text": "اب اوربٹ اپنے نئے دوستوں کے ساتھ پوری کہکشاں کو روشن کرتا ہے، اور خلا کبھی تنہا محسوس نہیں ہوتا۔",
-             "caption_roman": "Ab Orbit apne naye doston ke sath puri kehkashan ko roshan karta hai, aur khala kabhi tanha mehsoos nahi hota.",
-             "image_prompts": [
-                 "the planet character and star friends starting to line up together across the sky, bright pastel colors",
-                 "the planet character and stars glowing together, forming a colorful trail across the galaxy, sunny pastel colors",
-                 "the whole galaxy lit up brightly with the planet character and star friends celebrating together, joyful sunny pastel colors",
-             ]},
+            {"text": "Most people use AI chatbots completely wrong, and it's costing them much better answers.", "query": "person typing laptop screen"},
+            {"text": "Here's a simple trick: instead of just asking a question, show the AI an example of what you want first.", "query": "hands typing keyboard closeup"},
+            {"text": "This is called few shot prompting, and it works because AI learns better from examples than from instructions alone.", "query": "digital technology abstract lights"},
+            {"text": "Try this in your very next chat with any AI tool, and watch how much better the answer gets.", "query": "smartphone chat app screen"},
         ],
     },
 }
 
-STYLE_PREFIX = (
-    "Flat 2D vector cartoon illustration set in outer space, BRIGHT and "
-    "LIGHT color palette (soft pastel pink, light blue, lavender, warm "
-    "cream, sunny yellow), light sky background - NOT a dark or black "
-    "background, glowing stars, cute smiling planets, clean bold outlines, "
-    "simple shapes, portrait composition, no text or watermarks anywhere "
-    "in the image. "
-)
 
-
-def get_past_titles(language, limit=20):
-    """Read titles of previously uploaded videos in the same language, so we
-    can ask the AI to avoid repeating the same topic/story."""
+def get_past_titles(limit=20):
+    """Read titles of previously uploaded videos, so we can ask the AI to
+    avoid repeating the same topic."""
     if not os.path.exists(TRACKER_FILE):
         return []
     try:
@@ -189,146 +109,93 @@ def get_past_titles(language, limit=20):
             data = json.load(f)
         if not isinstance(data, list):
             return []
-        matching = [e for e in data if e.get("language", "en") == language]
-        return [entry.get("title", "") for entry in matching[-limit:] if entry.get("title")]
+        return [entry.get("title", "") for entry in data[-limit:] if entry.get("title")]
     except Exception:
         return []
 
 
-def get_trending_inspiration():
-    """Ask Gemini, with live Google Search grounding, what's actually
-    trending in space/astronomy short-form video right now. Returns a short
-    plain-text list, or None if search/AI isn't available - the script
-    still works fine without it, it just falls back to an evergreen story."""
-    if not GEMINI_KEY:
-        return None
-    try:
-        client = genai.Client(api_key=GEMINI_KEY)
-        response = client.models.generate_content(
-            model=TEXT_MODEL,
-            contents=(
-                "Search for what is trending in short-form video (YouTube "
-                "Shorts / TikTok / Reels) right now, today, related to "
-                "space, astronomy, galaxies, or planets. Reply with a "
-                "plain numbered list of 5 short, family-friendly themes, "
-                "topics, or space facts that are currently popular and "
-                "could realistically inspire a cute original animated "
-                "cartoon short about galaxies or planets (a fun space "
-                "fact, a relatable situation, a satisfying twist, or a "
-                "simple lesson). No branded characters, no real people. "
-                "No explanations, just the list."
-            ),
-            config=types.GenerateContentConfig(
-                tools=[types.Tool(google_search=types.GoogleSearch())],
-            ),
-        )
-        text = getattr(response, "text", None)
-        return text.strip() if text else None
-    except Exception as e:
-        print(f"Trend lookup failed, continuing without it: {type(e).__name__}: {e}")
-        return None
-
-
-def build_prompt(avoid_text, trend_text, language):
-    trend_block = ""
-    if trend_text:
-        trend_block = (
-            "Here is what's genuinely trending in short-form video right "
-            "now - loosely draw inspiration from ONE of these if it fits a "
-            "cute galaxy/planet cartoon story naturally, but don't force it "
-            "if none fit:\n"
-            f"{trend_text}\n\n"
-        )
-
-    story_rules = """- Every story must be set in space and centered on galaxies, planets, stars, or the solar system - no non-space settings.
-- 4 to 6 short scenes forming ONE complete mini story with a clear beginning, middle, and a satisfying end (a fun twist, a heartwarming moment, or a simple space fact woven into the story - whatever fits best).
-- Invent ONE simple, original, appealing cartoon character themed around space - a cute planet, star, comet, moon, or friendly alien/astronaut - NEVER a real branded or copyrighted character.
-- The very first sentence must be a bold, scroll-stopping hook - a surprising situation or question about space - written to grab attention in the first 2 seconds.
+def build_prompt(content_type, avoid_text):
+    topic_rules_ai = """- 4 to 6 scenes total.
+- Teach ONE genuinely useful, concrete AI tip, trick, or concept per video (e.g. a prompting technique, a way to save time, a common mistake to avoid, or a simple explanation of how AI works).
 - All scenes combined should read aloud in about 22-30 seconds (roughly 60-85 words total).
-- "character_sheet": a short, vivid visual description of the character's appearance (type, colors, accessories, expression) written for an AI image generator, detailed enough to stay visually consistent scene to scene. Always written in English.
-- Each scene needs "image_prompts": an array of EXACTLY 3 short prompts describing that scene's action as 3 distinct beats - a clear start, middle, and end of whatever happens in that scene (e.g. the character reaching out, then touching something, then reacting) - so they play like a tiny 3-frame flipbook, not 3 versions of the same static pose. Keep the setting consistent across the 3 beats, only the action/pose changes. Each beat must describe a BRIGHT, LIGHT-colored space scene (soft pastel nebula/sky, NOT a black or dark background). Always written in English.
-- hashtags should mix broad/high-traffic tags (like "cartoon", "shorts", "animation", "space") with a few specific to this exact story (e.g. a specific planet or galaxy name if relevant)."""
+- The very first sentence must be a bold, scroll-stopping hook - a surprising claim, mistake, or question - written to stop someone mid-scroll in the first 2 seconds. Then explain the tip clearly, then give one short concrete example.
+- Each "query" must describe generic, vivid, specific stock video footage (people using devices, offices, technology, abstract digital visuals) - never named apps' logos or real people - so it closely matches the sentence and can be found on a stock footage site.
+- hashtags should mix a couple of broad/high-traffic tags (like "ai", "shorts") with a few specific to this exact tip, to help discovery."""
 
-    if language == "ur":
-        return f"""You write short, punchy scripts for an original animated
-cartoon-shorts YouTube channel about galaxies and planets. This video is for
-Urdu-speaking viewers, but captions must be readable by anyone, including
-people who don't read Urdu script.
+    topic_rules_random = """- 4 to 6 scenes total.
+- All scenes combined should read aloud in about 22-30 seconds (roughly 60-85 words total).
+- The very first sentence must be a bold, scroll-stopping hook - a surprising claim or question - written to stop someone mid-scroll in the first 2 seconds. Then the rest should flow like a mini story with build-up and a surprising payoff.
+- Each "query" must describe generic, vivid, specific stock video footage (nature, objects, places, animals) - never named people or brands - so it closely matches the sentence and can be found on a stock footage site.
+- hashtags should mix a couple of broad/high-traffic tags (like "shorts", "facts") with a few specific to this exact topic, to help discovery."""
 
-{trend_block}{avoid_text}
+    topic_context = (
+        """You write short, punchy scripts for a YouTube Shorts channel
+that teaches everyday people practical AI tips, tricks, and beginner concepts
+for using AI chatbots and tools (like ChatGPT, Gemini, Claude, or similar) in
+daily life, work, or study. Assume the viewer is a curious beginner, not a
+programmer."""
+        if content_type == "ai_tips" else
+        """You write short, punchy scripts for a "did you know" style
+YouTube Shorts channel about surprising true facts (space, science, history,
+psychology, nature, animals, or the human body - pick ONE topic at random,
+something genuinely surprising and different each time)."""
+    )
+    topic_rules = topic_rules_ai if content_type == "ai_tips" else topic_rules_random
 
-- "title": a short, catchy title written in ROMAN URDU (Urdu typed with English/Latin letters) - NOT Urdu script, NOT Hindi Devanagari.
-- "text" (per scene): the SAME sentence written in proper URDU SCRIPT (Nastaliq/Arabic script), used only to generate the voice-over so it must be correct natural Urdu - never shown on screen.
-- "caption_roman" (per scene): the SAME sentence transliterated into ROMAN URDU. This is what appears as the on-screen caption.
+    return f"""{topic_context}
 
-Return ONLY valid JSON in exactly this shape, no extra commentary:
-{{
-  "title": "short catchy title in Roman Urdu, under 8 words",
-  "hashtags": ["5 to 8 relevant lowercase English hashtags, no # symbol"],
-  "character_sheet": "visual description of the character, in English",
-  "scenes": [
-    {{"text": "one or two spoken sentences in proper Urdu script", "caption_roman": "the same sentences in Roman Urdu", "image_prompts": ["start beat, in English", "middle beat, in English", "end beat, in English"]}}
-  ]
-}}
+{avoid_text}
 
-Rules:
-{story_rules}
-- Keep language simple and conversational, suitable for text-to-speech narration.
-"""
-    else:
-        return f"""You write short, punchy scripts for an original animated
-cartoon-shorts YouTube channel about galaxies and planets, in English.
-
-{trend_block}{avoid_text}
+Write the "title" and every scene's "text" in English.
 
 Return ONLY valid JSON in exactly this shape, no extra commentary:
 {{
   "title": "a short catchy title for the video, under 8 words",
-  "hashtags": ["5 to 8 relevant lowercase hashtags for this specific story, no # symbol"],
-  "character_sheet": "visual description of the character",
+  "hashtags": ["5 to 8 relevant lowercase hashtags for this specific video, no # symbol"],
   "scenes": [
-    {{"text": "one or two spoken sentences", "image_prompts": ["start beat", "middle beat", "end beat"]}}
+    {{"text": "one or two spoken sentences", "query": "2-4 word English stock-footage search term for this sentence"}}
   ]
 }}
 
 Rules:
-{story_rules}
-- Keep language simple and conversational, suitable for text-to-speech narration.
+{topic_rules}
+- Keep language simple, practical, and conversational, suitable for text-to-speech narration.
 """
 
 
-def generate_script_with_ai(language, trend_text, max_attempts=3):
+def generate_script_with_ai(content_type, max_attempts=3):
     if not GEMINI_KEY:
         print("GEMINI_API_KEY not set, using fallback script.")
-        return FALLBACK_SCRIPT[language]
+        return FALLBACK_SCRIPTS[content_type]
 
-    past_titles = get_past_titles(language)
+    past_titles = get_past_titles()
     avoid_text = ""
     if past_titles:
         avoid_text = (
-            "Do NOT repeat these stories/topics already covered, invent a "
-            "different character and a different story: " + "; ".join(past_titles)
+            "Do NOT repeat these topics already covered, pick something different: "
+            + "; ".join(past_titles)
         )
 
-    prompt = build_prompt(avoid_text, trend_text, language)
+    prompt = build_prompt(content_type, avoid_text)
 
     try:
         client = genai.Client(api_key=GEMINI_KEY)
     except Exception as e:
         print(f"Could not create Gemini client, using fallback script: {type(e).__name__}: {e}")
-        return FALLBACK_SCRIPT[language]
+        return FALLBACK_SCRIPTS[content_type]
 
     last_error = None
     for attempt in range(1, max_attempts + 1):
         try:
             response = client.models.generate_content(
-                model=TEXT_MODEL,
+                model=GEMINI_MODEL,
                 contents=prompt,
                 config=types.GenerateContentConfig(response_mime_type="application/json"),
             )
 
             raw_text = getattr(response, "text", None)
             if not raw_text:
+                # Often means the response was empty or blocked by safety filters
                 raise ValueError(
                     f"Empty response from Gemini (prompt_feedback={getattr(response, 'prompt_feedback', None)})"
                 )
@@ -341,15 +208,11 @@ def generate_script_with_ai(language, trend_text, max_attempts=3):
 
             data = json.loads(cleaned)
 
-            if not data.get("title") or not data.get("scenes") or not data.get("character_sheet"):
-                raise ValueError("AI response JSON is missing 'title', 'character_sheet' or 'scenes'.")
+            if not data.get("title") or not data.get("scenes"):
+                raise ValueError("AI response JSON is missing 'title' or 'scenes'.")
             for scene in data["scenes"]:
-                if not scene.get("text") or not scene.get("image_prompts"):
-                    raise ValueError("A scene in the AI response is missing 'text' or 'image_prompts'.")
-                if not isinstance(scene["image_prompts"], list) or len(scene["image_prompts"]) < 2:
-                    raise ValueError("A scene's 'image_prompts' must be a list of at least 2 beats.")
-                if language == "ur" and not scene.get("caption_roman"):
-                    raise ValueError("A scene in the AI response is missing 'caption_roman'.")
+                if not scene.get("text") or not scene.get("query"):
+                    raise ValueError("A scene in the AI response is missing 'text' or 'query'.")
 
             print(f"Gemini script generated successfully on attempt {attempt}/{max_attempts}.")
             return data
@@ -358,131 +221,92 @@ def generate_script_with_ai(language, trend_text, max_attempts=3):
             last_error = e
             print(f"[Attempt {attempt}/{max_attempts}] Gemini script generation failed: {type(e).__name__}: {e}")
             if attempt < max_attempts:
-                time.sleep(3 * attempt)
+                time.sleep(3 * attempt)  # brief backoff before retrying
 
     print(f"All {max_attempts} Gemini attempts failed, using fallback script. Last error: {last_error}")
-    return FALLBACK_SCRIPT[language]
+    return FALLBACK_SCRIPTS[content_type]
 
 
-def fit_to_size(img, target_w, target_h):
-    """Resize + center-crop an image to exactly target_w x target_h,
-    since the image model doesn't guarantee an exact output size."""
-    img = img.convert("RGB")
-    w, h = img.size
-    scale = max(target_w / w, target_h / h)
-    new_w, new_h = int(w * scale) + 1, int(h * scale) + 1
-    img = img.resize((new_w, new_h), PIL.Image.Resampling.LANCZOS)
-    x1 = (new_w - target_w) // 2
-    y1 = (new_h - target_h) // 2
-    return img.crop((x1, y1, x1 + target_w, y1 + target_h))
+async def _edge_tts_save(text, voice, output_path):
+    communicate = edge_tts.Communicate(text, voice)
+    await communicate.save(output_path)
 
 
-def generate_cartoon_image(prompt_text, index, target_w, target_h, seed):
-    """Fetch one cartoon frame from Pollinations' free image endpoint (no
-    key, no signup, no daily cap) at the given size. Falls back to a plain
-    LIGHT frame if generation fails for any reason (timeout, bad response,
-    etc.) so the pipeline never crashes and never shows a dark frame.
-    Always paces itself ~15s before returning, success or fallback, since
-    the anonymous tier is shared and this now gets called several times
-    per scene."""
-    fallback = PIL.Image.new("RGB", (target_w, target_h), (235, 240, 255))
-    url = POLLINATIONS_URL.format(prompt=requests.utils.quote(prompt_text))
-    params = {"width": target_w, "height": target_h, "seed": seed, "nologo": "true"}
+def synthesize_speech(text, output_path):
+    """Generate the narration audio using Microsoft Edge's free neural TTS
+    (via the edge-tts library) - no API key, no account, no cost, and much
+    more natural-sounding than gTTS. Falls back to gTTS automatically if
+    edge-tts fails for any reason (e.g. no internet, service hiccup), so the
+    pipeline never crashes."""
+    try:
+        asyncio.run(_edge_tts_save(text, EDGE_TTS_VOICE, output_path))
+        return
+    except Exception as e:
+        print(f"edge-tts failed, falling back to gTTS: {type(e).__name__}: {e}")
 
-    image = fallback
+    gTTS(text=text, lang="en").save(output_path)
+
+
+def apply_zoom(clip, duration, zoom_ratio=0.15):
+    """Subtle Ken Burns style zoom-in over the clip's duration, so the
+    background feels alive instead of a static shot. Cheap production-value
+    boost, no extra API/cost involved."""
+    try:
+        def zoom_factor(t):
+            return 1 + zoom_ratio * (t / duration)
+
+        zoomed = clip.resized(zoom_factor)
+        return CompositeVideoClip(
+            [zoomed.with_position("center")], size=(WIDTH, HEIGHT)
+        ).with_duration(duration)
+    except Exception as e:
+        print(f"Zoom effect failed, using plain clip: {e}")
+        return clip
+
+
+def fetch_clip(query, duration_needed, index):
+    headers = {"Authorization": PEXELS_KEY}
+    url = "https://api.pexels.com/videos/search?query=" + query + chr(38) + "per_page=1"
+    video_file = f"bg_{index}.mp4"
+
     for attempt in range(3):
         try:
-            resp = requests.get(url, params=params, timeout=60)
-            if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image"):
-                image = PIL.Image.open(io.BytesIO(resp.content))
-                break
-            print(f"Pollinations returned {resp.status_code} for scene {index}: {resp.text[:150]}")
+            time.sleep(1)
+            resp = requests.get(url, headers=headers, timeout=10)
+            if resp.status_code == 200 and resp.json().get("videos"):
+                v_files = resp.json()["videos"][0]["video_files"]
+                hd_file = max(v_files, key=lambda x: x.get("width", 0))
+                with open(video_file, "wb") as vf:
+                    vf.write(requests.get(hd_file["link"], timeout=15).content)
+                clip = VideoFileClip(video_file).without_audio()
+                w, h = clip.size
+                scale = HEIGHT / h
+                new_w = int(w * scale)
+                clip = clip.resized((new_w, HEIGHT))
+                x1 = (new_w - WIDTH) // 2
+                clip = clip.cropped(x1=x1, y1=0, x2=x1 + WIDTH, y2=HEIGHT)
+                clips_list = []
+                cur_dur = 0
+                while cur_dur < duration_needed:
+                    clips_list.append(clip)
+                    cur_dur += clip.duration
+                final_clip = concatenate_videoclips(clips_list).subclipped(0, duration_needed)
+                return apply_zoom(final_clip, duration_needed)
+            else:
+                print(f"Pexels returned status {resp.status_code} for query '{query}': {resp.text[:200]}")
         except Exception as e:
-            print(f"[Attempt {attempt+1}/3] Image fetch failed for scene {index}: {type(e).__name__}: {e}")
-        time.sleep(POLLINATIONS_PACING_SECONDS)
+            print(f"Attempt {attempt+1} failed for {query}: {e}")
+            time.sleep(2)
 
-    time.sleep(POLLINATIONS_PACING_SECONDS)
-    return image
-
-
-def generate_scene_image(prompt_text, index, seed):
-    """Fetch ONE oversized image (bigger than the final WIDTH x HEIGHT by
-    PAN_MARGIN) and fit it to that oversized canvas, so build_ken_burns_clip()
-    has real room to pan/zoom across it without ever hitting an edge."""
-    src_w = int(WIDTH * (1 + PAN_MARGIN))
-    src_h = int(HEIGHT * (1 + PAN_MARGIN))
-    raw = generate_cartoon_image(prompt_text, index, src_w, src_h, seed)
-    return fit_to_size(raw, src_w, src_h)
-
-
-def _ken_burns_params(img_size):
-    """Pick a random pan/zoom trajectory for one oversized image: which
-    corner it drifts from/to, and whether it zooms in or out."""
-    src_w, src_h = img_size
-    max_dx = max(src_w - WIDTH, 1)
-    max_dy = max(src_h - HEIGHT, 1)
-    return {
-        "zoom_in": random.random() < 0.5,
-        "start": (random.uniform(0, max_dx), random.uniform(0, max_dy)),
-        "end": (random.uniform(0, max_dx), random.uniform(0, max_dy)),
-    }
-
-
-def _ken_burns_frame(img, params, progress, zoom_ratio=KEN_BURNS_ZOOM_RATIO):
-    """Render one frame of a continuous pan+zoom over `img` at the given
-    progress (0..1 through however long this image is being shown)."""
-    progress = min(max(progress, 0), 1)
-    src_w, src_h = img.size
-    zoom = 1 + zoom_ratio * (progress if params["zoom_in"] else (1 - progress))
-    crop_w = min(src_w, WIDTH / zoom)
-    crop_h = min(src_h, HEIGHT / zoom)
-    (sx, sy), (ex, ey) = params["start"], params["end"]
-    cx = sx + (ex - sx) * progress
-    cy = sy + (ey - sy) * progress
-    cx = max(0, min(cx, src_w - crop_w))
-    cy = max(0, min(cy, src_h - crop_h))
-    return img.crop((cx, cy, cx + crop_w, cy + crop_h)).resize((WIDTH, HEIGHT), PIL.Image.Resampling.LANCZOS)
-
-
-def build_ken_burns_clip(img, duration):
-    """Continuous pan + zoom over a single oversized still image."""
-    params = _ken_burns_params(img.size)
-
-    def make_frame(t):
-        return np.array(_ken_burns_frame(img, params, t / duration))
-
-    return VideoClip(make_frame, duration=duration)
-
-
-def build_animated_scene_clip(images, duration):
-    """Crossfade continuously through several distinct AI keyframes for
-    this scene (each with its own slow pan+zoom), so the scene shows real
-    story motion - the character/action visibly changing - instead of just
-    the camera moving over one static picture."""
-    if len(images) == 1:
-        return build_ken_burns_clip(images[0], duration)
-
-    n = len(images)
-    seg_dur = duration / (n - 1)
-    params = [_ken_burns_params(img.size) for img in images]
-
-    def make_frame(t):
-        t = min(max(t, 0), duration - 1e-6)
-        seg = min(int(t / seg_dur), n - 2)
-        local = (t - seg * seg_dur) / seg_dur
-        blend = (1 - np.cos(np.pi * local)) / 2  # eased 0 -> 1 across the segment
-
-        frame_a = _ken_burns_frame(images[seg], params[seg], (seg + local) / (n - 1))
-        frame_b = _ken_burns_frame(images[seg + 1], params[seg + 1], (seg + 1 + local) / (n - 1))
-        arr = np.array(frame_a).astype(np.float32) * (1 - blend) + np.array(frame_b).astype(np.float32) * blend
-        return arr.astype("uint8")
-
-    return VideoClip(make_frame, duration=duration)
+    return ImageClip(np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)).with_duration(duration_needed)
 
 
 def add_caption(bg_clip, caption_text, duration, is_cta=False, chunk_words=4):
-    """Split the caption into short chunks that appear one after another in
-    sync with the scene's audio - fast-paced style common on Shorts."""
+    """Split the caption into short chunks (a few words each) that appear one
+    after another in sync with the scene's audio - a fast-paced style common
+    on high-performing Shorts, instead of one long static sentence sitting on
+    screen the whole time. Falls back to the plain background clip if caption
+    rendering fails for any reason, so the pipeline never crashes."""
     try:
         words = caption_text.split()
         chunks = [" ".join(words[i:i + chunk_words]) for i in range(0, len(words), chunk_words)] or [caption_text]
@@ -510,8 +334,9 @@ def add_caption(bg_clip, caption_text, duration, is_cta=False, chunk_words=4):
 
 
 def add_title_flash(scene_clip, title_text, flash_duration=1.5):
-    """Big bold title card for the first ~1.5s of the first scene, as a
-    stronger scroll-stopping hook."""
+    """Overlay a big bold title card for the first ~1.5 seconds of the very
+    first scene, as a stronger scroll-stopping hook. Falls back to the plain
+    scene clip if anything goes wrong."""
     try:
         flash_len = min(flash_duration, scene_clip.duration)
         title_clip = TextClip(
@@ -534,8 +359,8 @@ def add_title_flash(scene_clip, title_text, flash_duration=1.5):
 
 def add_background_music(narration_audio, duration):
     """Mix a quiet, looped royalty-free track under the narration. Put a few
-    .mp3 files in a 'music' folder in the repo. If missing/empty, narration
-    plays with no music."""
+    .mp3 files in a 'music' folder in the repo - one is picked at random each
+    run. If the folder is missing or empty, narration plays with no music."""
     if not os.path.isdir(MUSIC_DIR):
         print("No 'music' folder found, skipping background music.")
         return narration_audio
@@ -555,7 +380,7 @@ def add_background_music(narration_audio, duration):
             loop_clips.append(music)
             cur_dur += music.duration
         music_full = concatenate_audioclips(loop_clips).subclipped(0, duration)
-        music_quiet = music_full.with_volume_scaled(0.15)
+        music_quiet = music_full.with_volume_scaled(0.15)  # keep narration clearly audible
 
         return CompositeAudioClip([narration_audio, music_quiet])
     except Exception as e:
@@ -607,14 +432,10 @@ def upload_to_youtube(video_path, title, description, tags):
             "title": title,
             "description": description,
             "tags": tags,
-            "categoryId": "1",  # Film & Animation
+            "categoryId": "27",  # Education
         },
         "status": {
             "privacyStatus": "public",
-            # IMPORTANT: set this honestly based on the final content of
-            # each video. If a story is genuinely made/targeted for
-            # children, this must be True - YouTube/COPPA rules apply
-            # regardless of what a script auto-generates.
             "selfDeclaredMadeForKids": False,
         },
     }
@@ -633,7 +454,7 @@ def upload_to_youtube(video_path, title, description, tags):
     return video_id
 
 
-def update_tracker(video_id, title, language):
+def update_tracker(video_id, title, content_type):
     data = []
     if os.path.exists(TRACKER_FILE):
         try:
@@ -647,7 +468,7 @@ def update_tracker(video_id, title, language):
     data.append({
         "video_id": video_id,
         "title": title,
-        "language": language,
+        "content_type": content_type,
         "uploaded_at": datetime.now(timezone.utc).isoformat(),
         "url": f"https://youtube.com/shorts/{video_id}",
     })
@@ -656,57 +477,26 @@ def update_tracker(video_id, title, language):
         json.dump(data, f, indent=2)
 
 
-def cleanup_temp_files(num_scenes):
-    for i in range(num_scenes):
-        path = f"part_{i}.mp3"
-        try:
-            if os.path.exists(path):
-                os.remove(path)
-        except Exception:
-            pass
-
-
 def generate_video():
     target_duration = round(random.uniform(MIN_DURATION, MAX_DURATION), 1)
-    language = get_run_config()
+    content_type = get_run_config()
 
-    trend_text = get_trending_inspiration()
-    script = generate_script_with_ai(language, trend_text)
+    script = generate_script_with_ai(content_type)
     title = script["title"]
-    character_sheet = script["character_sheet"]
-    cta_scene = CTA_SCENE_UR if language == "ur" else CTA_SCENE_EN
-    scenes = list(script["scenes"]) + [cta_scene]
-    tts_lang = "ur" if language == "ur" else "en"
+    scenes = list(script["scenes"]) + [CTA_SCENE]
 
-    print(f"Language: {language} | Topic: {title} | Target duration: {target_duration}s")
-    if trend_text:
-        print(f"Trend inspiration used:\n{trend_text}")
-
-    # Same base seed for every scene in this video, so the free image
-    # endpoint stays in a consistent art style/palette across the story;
-    # each beat still gets its own offset so the 3 frames within a scene
-    # come out visibly different from each other.
-    video_seed = random.randint(1, 999999)
+    print(f"Content type: {content_type} | Topic: {title} | Target duration: {target_duration}s")
 
     audio_clips = []
     video_clips = []
     for i, scene in enumerate(scenes):
         fname = f"part_{i}.mp3"
-        gTTS(text=scene["text"], lang=tts_lang).save(fname)
+        synthesize_speech(scene["text"], fname)
         aclip = AudioFileClip(fname)
         audio_clips.append(aclip)
 
-        beats = CTA_IMAGE_BEATS if scene.get("cta") else scene["image_prompts"]
-
-        scene_images = []
-        for b, beat in enumerate(beats):
-            img_prompt = STYLE_PREFIX + "Character: " + character_sheet + ". Scene: " + beat
-            beat_seed = video_seed + i * 10 + b
-            scene_images.append(generate_scene_image(img_prompt, f"{i}.{b}", beat_seed))
-
-        bg_clip = build_animated_scene_clip(scene_images, aclip.duration)
-
-        caption_text = scene.get("caption") or scene.get("caption_roman") or scene["text"]
+        bg_clip = fetch_clip(scene["query"], aclip.duration, i)
+        caption_text = scene.get("caption") or scene["text"]
         scene_clip = add_caption(bg_clip, caption_text, aclip.duration, is_cta=scene.get("cta", False))
         if i == 0:
             scene_clip = add_title_flash(scene_clip, title)
@@ -739,20 +529,20 @@ def generate_video():
     output_path = "final_short.mp4"
     final.write_videofile(output_path, fps=30, codec="libx264", audio_codec="aac", bitrate="5000k")
 
-    base_tags = ["cartoon", "shorts", "animation", "space"]
+    if content_type == "ai_tips":
+        base_tags = ["ai", "aitips", "chatgpt", "productivity", "shorts"]
+    else:
+        base_tags = ["shorts", "facts", "didyouknow"]
+
     ai_hashtags = [h.strip().lstrip("#").lower() for h in script.get("hashtags", []) if h.strip()]
-    all_tags = list(dict.fromkeys(ai_hashtags + base_tags))
+    all_tags = list(dict.fromkeys(ai_hashtags + base_tags))  # AI's topic-specific tags first, deduped
 
     hashtag_line = " ".join(f"#{t}" for t in all_tags[:8])
-    subscribe_line = (
-        "Rozana nayi cartoon video ke liye subscribe karein!" if language == "ur"
-        else "Subscribe for a new cartoon every single day!"
-    )
+    subscribe_line = "Subscribe for a new video every single day!"
     description = f"{title}\n\n{subscribe_line}\n\n{hashtag_line}"
 
     video_id = upload_to_youtube(output_path, title, description, all_tags)
-    update_tracker(video_id, title, language)
-    cleanup_temp_files(len(scenes))
+    update_tracker(video_id, title, content_type)
 
 
 if __name__ == "__main__":
