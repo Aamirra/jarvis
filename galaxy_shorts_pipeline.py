@@ -48,16 +48,15 @@ CATEGORY_IDS = {"ai_tips": "27", "random": "28"}
 # Font used for on-screen captions (installed via apt in the workflow: fonts-dejavu-core).
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
-# One run every 4 hours (UTC), alternating between the two content types.
-# Update your workflow's cron to '0 */4 * * *' so it actually triggers here.
-# Want more videos per day? Add more hours below (e.g. every 2 hours for 12/day)
-# and update the cron schedule to match.
+# One run every 4 hours (UTC). The channel is AI-learning only now, so every
+# slot is "ai_tips". Update your workflow's cron to '0 */4 * * *' to match.
+# Want more videos per day? Add more hours below and update the cron too.
 RUN_SCHEDULE = {
-    0: "random",
+    0: "ai_tips",
     4: "ai_tips",
-    8: "random",
+    8: "ai_tips",
     12: "ai_tips",
-    16: "random",
+    16: "ai_tips",
     20: "ai_tips",
 }
 
@@ -103,22 +102,55 @@ FALLBACK_SCRIPTS = {
 }
 
 
-def get_past_titles(limit=20):
-    """Read titles of previously uploaded videos, so we can ask the AI to
-    avoid repeating the same topic."""
+def _read_tracker():
     if not os.path.exists(TRACKER_FILE):
         return []
     try:
         with open(TRACKER_FILE) as f:
             data = json.load(f)
-        if not isinstance(data, list):
-            return []
-        return [entry.get("title", "") for entry in data[-limit:] if entry.get("title")]
+        return data if isinstance(data, list) else []
     except Exception:
         return []
 
 
-def build_prompt(content_type, avoid_text):
+def get_past_titles(limit=100):
+    """Read titles of previously uploaded videos, so we can ask the AI to
+    avoid repeating the same topic."""
+    return [e.get("title", "") for e in _read_tracker()[-limit:] if e.get("title")]
+
+
+# Rotating angles for the AI-learning channel, so consecutive videos don't
+# all feel like the same template.
+AI_SUBTOPICS = [
+    "writing better prompts (prompt techniques and formulas)",
+    "using AI to boost productivity and save time at work",
+    "using AI for studying, learning faster, and exam prep",
+    "using AI for coding and learning to program as a beginner",
+    "free AI tools most people don't know about",
+    "common mistakes beginners make with AI chatbots",
+    "how AI actually works, explained simply (no jargon)",
+    "using AI for writing: emails, resumes, and social media posts",
+    "using AI for research, summarizing, and fact-checking",
+    "using AI for side income, freelancing, and career growth",
+    "AI for creativity: ideas, design, video, and images",
+    "AI safety and privacy tips everyday users should know",
+]
+
+
+def pick_subtopic():
+    """Pick the AI subtopic used least recently (by the tracker history), so
+    the channel cycles through every angle before repeating one. Falls back
+    to a random pick if there's no history yet."""
+    history = [e.get("subtopic") for e in _read_tracker() if e.get("subtopic")]
+    last_used = {}
+    for idx, sub in enumerate(history):
+        last_used[sub] = idx
+    # Never-used subtopics (index -1) come first; ties broken randomly.
+    candidates = sorted(AI_SUBTOPICS, key=lambda t: (last_used.get(t, -1), random.random()))
+    return candidates[0]
+
+
+def build_prompt(content_type, avoid_text, subtopic=None):
     topic_rules_ai = """- 4 to 6 scenes total.
 - Teach ONE genuinely useful, concrete AI tip, trick, or concept per video (e.g. a prompting technique, a way to save time, a common mistake to avoid, or a simple explanation of how AI works).
 - All scenes combined should read aloud in about 22-30 seconds (roughly 60-85 words total).
@@ -146,7 +178,13 @@ something genuinely surprising and different each time)."""
     )
     topic_rules = topic_rules_ai if content_type == "ai_tips" else topic_rules_random
 
+    subtopic_text = (
+        f"Focus this video on this angle: {subtopic}." if subtopic and content_type == "ai_tips" else ""
+    )
+
     return f"""{topic_context}
+
+{subtopic_text}
 
 {avoid_text}
 
@@ -167,7 +205,7 @@ Rules:
 """
 
 
-def generate_script_with_ai(content_type, max_attempts=3):
+def generate_script_with_ai(content_type, subtopic=None, max_attempts=3):
     if not GEMINI_KEY:
         print("GEMINI_API_KEY not set, using fallback script.")
         return FALLBACK_SCRIPTS[content_type]
@@ -180,7 +218,7 @@ def generate_script_with_ai(content_type, max_attempts=3):
             + "; ".join(past_titles)
         )
 
-    prompt = build_prompt(content_type, avoid_text)
+    prompt = build_prompt(content_type, avoid_text, subtopic)
 
     try:
         client = genai.Client(api_key=GEMINI_KEY)
@@ -253,7 +291,7 @@ def score_hook(text):
     return score
 
 
-def generate_best_script(content_type, candidates=2):
+def generate_best_script(content_type, subtopic=None, candidates=2):
     """Generate a couple of script candidates and keep the one with the
     strongest hook (first scene's opening line), instead of settling for
     whatever comes back on the first try. Costs one extra free-tier Gemini
@@ -263,7 +301,7 @@ def generate_best_script(content_type, candidates=2):
 
     best, best_score = None, -1
     for _ in range(candidates):
-        data = generate_script_with_ai(content_type)
+        data = generate_script_with_ai(content_type, subtopic)
         if data is FALLBACK_SCRIPTS[content_type]:
             continue  # a fallback isn't a real candidate to compare
         score = score_hook(data["scenes"][0]["text"])
@@ -584,7 +622,7 @@ def upload_to_youtube(video_path, title, description, tags, category_id="27"):
     return video_id
 
 
-def update_tracker(video_id, title, content_type):
+def update_tracker(video_id, title, content_type, subtopic=None):
     data = []
     if os.path.exists(TRACKER_FILE):
         try:
@@ -599,6 +637,7 @@ def update_tracker(video_id, title, content_type):
         "video_id": video_id,
         "title": title,
         "content_type": content_type,
+        "subtopic": subtopic,
         "uploaded_at": datetime.now(timezone.utc).isoformat(),
         "url": f"https://youtube.com/shorts/{video_id}",
     })
@@ -611,11 +650,12 @@ def generate_video():
     target_duration = round(random.uniform(MIN_DURATION, MAX_DURATION), 1)
     content_type = get_run_config()
 
-    script = generate_best_script(content_type)
+    subtopic = pick_subtopic() if content_type == "ai_tips" else None
+    script = generate_best_script(content_type, subtopic)
     title = script["title"]
     scenes = list(script["scenes"]) + [CTA_SCENE]
 
-    print(f"Content type: {content_type} | Topic: {title} | Target duration: {target_duration}s")
+    print(f"Content type: {content_type} | Subtopic: {subtopic} | Topic: {title} | Target duration: {target_duration}s")
 
     used_video_ids = set()  # avoid the same stock clip showing up twice in one video
     audio_clips = []
@@ -674,7 +714,7 @@ def generate_video():
     description = f"{title}\n\n{subscribe_line}\n\n{hashtag_line}"
 
     video_id = upload_to_youtube(output_path, title, description, all_tags, category_id=CATEGORY_IDS.get(content_type, "27"))
-    update_tracker(video_id, title, content_type)
+    update_tracker(video_id, title, content_type, subtopic)
 
 
 if __name__ == "__main__":
