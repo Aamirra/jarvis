@@ -32,6 +32,7 @@ jobs:
     - name: Run Galaxy Shorts Script
       env:
         GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
         TOKEN_JSON: ${{ secrets.TOKEN_JSON_NEW_CHANNEL }}
         CLIENT_SECRET_JSON: ${{ secrets.CLIENT_SECRET_JSON_NEW_CHANNEL }}
       run: |
