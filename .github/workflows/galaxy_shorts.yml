@@ -2,9 +2,11 @@ name: Galaxy Shorts Auto Pipeline
 
 on:
   schedule:
-    # Har 4 ghante baad (UTC) automatic chalay ga
     - cron: '0 */4 * * *'
-  workflow_dispatch: # Manual Run button ke liye
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build-and-run:
@@ -37,3 +39,12 @@ jobs:
         CLIENT_SECRET_JSON: ${{ secrets.CLIENT_SECRET_JSON_NEW_CHANNEL }}
       run: |
         python galaxy_shorts_pipeline.py
+
+    - name: Save upload tracker
+      if: success()
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git add upload_tracker.json
+        git commit -m "Update upload tracker" || echo "Nothing to commit"
+        git push
