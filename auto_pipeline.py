@@ -2,17 +2,18 @@ import os
 import json
 import random
 import time
+import asyncio
 from datetime import datetime, timezone
 
 import requests
 import numpy as np
 import PIL.Image
 if not hasattr(PIL.Image, "ANTIALIAS"): PIL.Image.ANTIALIAS = PIL.Image.Resampling.LANCZOS
-from gtts import gTTS
+import edge_tts
 from moviepy import (
     VideoFileClip, AudioFileClip, ImageClip, concatenate_videoclips,
     concatenate_audioclips, TextClip, CompositeVideoClip, AudioClip,
-    CompositeAudioClip
+    CompositeAudioClip, vfx
 )
 
 from google import genai
@@ -24,23 +25,36 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
 WIDTH, HEIGHT = 1080, 1920
-MIN_DURATION = 30.0
-MAX_DURATION = 40.0  # each video's final length is picked randomly between these
+MIN_DURATION = 18.0
+MAX_DURATION = 28.0  # final video is trimmed to MAX / padded to MIN only if the natural length falls outside this range
 PEXELS_KEY = os.environ.get("PEXELS_API_KEY")
+PIXABAY_KEY = os.environ.get("PIXABAY_API_KEY")  # optional, free: https://pixabay.com/api/docs/
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 GEMINI_MODEL = "gemini-3.1-flash-lite"  # cheap + fast, plenty for short scripts
 
 TRACKER_FILE = "upload_tracker.json"
-MUSIC_DIR = "music"  # put a few royalty-free .mp3 files here; one is picked at random each run
+MUSIC_DIR = "music"  # royalty-free .mp3 files; one is picked at random each run
+SFX_DIR = "sfx"      # short transition sounds (e.g. whoosh.mp3); optional
+
+# Pacing: narration is sped up via edge-tts' native rate (keeps pitch natural),
+# and stock footage is sped up with MoviePy's MultiplySpeed so visuals feel snappy too.
+SPEED_FACTOR = 1.12
+NARRATION_RATE = f"+{int(round((SPEED_FACTOR - 1) * 100))}%"
+
+VOICES = {
+    "en": "en-US-ChristopherNeural",
+    "ur": "ur-PK-AsadNeural",
+}
 
 # Font used for on-screen captions (installed via apt in the workflow: fonts-dejavu-core).
-# Captions are always shown in Latin/Roman script (English, or Roman Urdu) so
-# one font covers both languages - no extra font file needed.
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
+# Captions sit at screen center so the Shorts UI (title, buttons, channel) never covers them.
+CAPTION_Y_RATIO = 0.48
+CAPTION_COLORS = ["white", "yellow"]  # alternates per word chunk for a Hormozi-style pop
+
 # 6 runs per day, one every 4 hours (UTC), split 3 English / 3 Urdu and evenly
-# across both content types. Update your workflow's cron to '0 */4 * * *' so
-# it actually triggers at these hours.
+# across both content types. Workflow cron: '0 */4 * * *'.
 RUN_SCHEDULE = {
     0: ("random", "en"),
     4: ("ai_tips", "ur"),
@@ -49,6 +63,8 @@ RUN_SCHEDULE = {
     16: ("random", "en"),
     20: ("ai_tips", "ur"),
 }
+
+USED_CLIP_IDS = set()  # avoid the same stock clip appearing twice in one video
 
 
 def get_run_config():
@@ -60,22 +76,21 @@ def get_run_config():
     return RUN_SCHEDULE[closest_hour]
 
 
-# Urdu runs: "text" stays in proper Urdu script because gTTS needs real Urdu
+# Urdu runs: "text" stays in proper Urdu script because TTS needs real Urdu
 # script to pronounce it correctly - that field is only ever used for the
-# voice-over, never shown on screen. "caption" is Roman Urdu, so anyone can
-# read the on-screen text, not just people who read the Urdu script.
+# voice-over, never shown on screen. "caption" is Roman Urdu.
 CTA_SCENE_EN = {
-    "text": "If this blew your mind, hit that subscribe button and turn on notifications, because we post brand new videos every single day.",
-    "query": "colorful nebula space bright",
+    "text": "Follow for a brand new one every single day.",
+    "query": "neon gradient abstract motion background",
     "cta": True,
-    "caption": "SUBSCRIBE FOR MORE!",
+    "caption": "FOLLOW FOR A NEW ONE EVERY DAY!",
 }
 
 CTA_SCENE_UR = {
-    "text": "اگر یہ ویڈیو پسند آئی تو سبسکرائب کریں اور نوٹیفکیشن آن کریں، کیونکہ ہم روزانہ نئی ویڈیوز پوسٹ کرتے ہیں۔",
-    "query": "colorful nebula space bright",
+    "text": "روزانہ نئی ویڈیو کے لیے فالو کریں۔",
+    "query": "neon gradient abstract motion background",
     "cta": True,
-    "caption": "SUBSCRIBE KAREIN!",
+    "caption": "ROZANA NAYI VIDEO KE LIYE FOLLOW KAREIN!",
 }
 
 # Used only if AI script generation fails, so the pipeline never crashes.
@@ -127,10 +142,13 @@ FALLBACK_SCRIPTS = {
 }
 
 
+# ----------------------------------------------------------------------------
+# Script generation (Gemini)
+# ----------------------------------------------------------------------------
+
 def get_past_titles(language, limit=20):
-    """Read titles of previously uploaded videos in the same language, so we
-    can ask the AI to avoid repeating the same topic. Older tracker entries
-    saved before language tracking was added are treated as English."""
+    """Titles of previously uploaded videos in the same language, so the AI
+    avoids repeating topics. Old entries without a language are treated as English."""
     if not os.path.exists(TRACKER_FILE):
         return []
     try:
@@ -145,18 +163,21 @@ def get_past_titles(language, limit=20):
 
 
 def build_prompt(content_type, avoid_text, language):
-    topic_rules_ai = """- 4 to 6 scenes total.
-- Teach ONE genuinely useful, concrete AI tip, trick, or concept per video (e.g. a prompting technique, a way to save time, a common mistake to avoid, or a simple explanation of how AI works).
-- All scenes combined should read aloud in about 22-30 seconds (roughly 60-85 words total).
-- The very first sentence must be a bold, scroll-stopping hook - a surprising claim, mistake, or question - written to stop someone mid-scroll in the first 2 seconds. Then explain the tip clearly, then give one short concrete example.
-- Each "query" must describe generic, vivid, specific stock video footage (people using devices, offices, technology, abstract digital visuals) - never named apps' logos or real people - so it closely matches the sentence and can be found on a stock footage site.
-- hashtags should mix a couple of broad/high-traffic tags (like "ai", "shorts") with a few specific to this exact tip, to help discovery."""
+    hook_rules = """- HOOK (scene 1, first sentence): max 12 words. It must be a bold, surprising CLAIM or STATEMENT that creates instant curiosity or a little shock - e.g. "Your brain deletes 90% of what you see." or "You're using ChatGPT wrong, and it's costing you hours." NEVER open with a question. NEVER start with "Did you know", "Have you ever", "What if", "Imagine", "Today", "Let's talk about" or any greeting/intro.
+- Scene 1 must deliver the hook in its first sentence and immediately tease the payoff so viewers stay to the end.
+- Keep every scene SHORT: one sentence, 6 to 14 words. Short sentences = fast cuts = higher retention.
+- 3 to 5 scenes total, about 40-58 words in total (it will be read aloud at a fast pace in ~16-22 seconds).
+- End with a punchy payoff or a one-line takeaway that makes the viewer want to rewatch. Do NOT add a subscribe/follow call-to-action - it is added automatically.
+- Each "query" must be a highly SPECIFIC, vivid stock-footage search phrase of 3 to 6 English words that names a concrete subject, an action, and a setting (e.g. "astronaut floating outside space station", "close up hands typing laptop night", "ocean wave crashing rocks slow motion"). NEVER use 1-word or vague queries like "space", "technology", "nature". No brand logos, no named people, no on-screen text.
+- Make each scene's query visually DIFFERENT from the others so the video does not feel repetitive."""
 
-    topic_rules_random = """- 4 to 6 scenes total.
-- All scenes combined should read aloud in about 22-30 seconds (roughly 60-85 words total).
-- The very first sentence must be a bold, scroll-stopping hook - a surprising claim or question - written to stop someone mid-scroll in the first 2 seconds. Then the rest should flow like a mini story with build-up and a surprising payoff.
-- Each "query" must describe generic, vivid, specific stock video footage (nature, objects, places, animals) - never named people or brands - so it closely matches the sentence and can be found on a stock footage site.
-- hashtags should mix a couple of broad/high-traffic tags (like "shorts", "facts") with a few specific to this exact topic, to help discovery."""
+    topic_rules_ai = """- Teach ONE genuinely useful, concrete AI tip, trick, or concept per video (e.g. a prompting technique, a way to save time, a common mistake to avoid, or a simple explanation of how AI works), with one short concrete example.
+- Query footage should be generic and vivid: people using devices, offices, technology, abstract digital visuals.
+- hashtags should mix a couple of broad/high-traffic tags (like "ai", "shorts") with a few specific to this exact tip."""
+
+    topic_rules_random = """- Tell a mini story with build-up and a surprising payoff about ONE true, mind-blowing fact.
+- Query footage should be generic and vivid: nature, objects, places, animals.
+- hashtags should mix a couple of broad/high-traffic tags (like "shorts", "facts") with a few specific to this exact topic."""
 
     topic_context = (
         """You write short, punchy scripts for a YouTube Shorts channel
@@ -165,7 +186,7 @@ for using AI chatbots and tools (like ChatGPT, Gemini, Claude, or similar) in
 daily life, work, or study. Assume the viewer is a curious beginner, not a
 programmer."""
         if content_type == "ai_tips" else
-        """You write short, punchy scripts for a "did you know" style
+        """You write short, punchy scripts for a "mind-blowing facts"
 YouTube Shorts channel about surprising true facts (space, science, history,
 psychology, nature, animals, or the human body - pick ONE topic at random,
 something genuinely surprising and different each time)."""
@@ -180,8 +201,8 @@ something genuinely surprising and different each time)."""
 IMPORTANT - this video is for Urdu-speaking viewers, but captions must be
 readable by anyone, including Hindi speakers who don't read the Urdu script:
 - "title": a short, catchy title written in ROMAN URDU (Urdu typed with English/Latin letters, the way most people type Urdu on WhatsApp/Instagram) - NOT Urdu script, NOT Hindi Devanagari.
-- "text" (per scene): the SAME sentence written in proper URDU SCRIPT (Nastaliq/Arabic script). This is used only to generate the voice-over, so it must be correct, natural Urdu script for the voice to sound right - it is never shown on screen.
-- "caption_roman" (per scene): the SAME sentence transliterated into ROMAN URDU. This is what actually appears as the on-screen caption.
+- "text" (per scene): the SAME sentence written in proper URDU SCRIPT (Nastaliq/Arabic script). Used only for the voice-over, so it must be correct, natural Urdu script - never shown on screen.
+- "caption_roman" (per scene): the SAME sentence transliterated into ROMAN URDU. This is what appears as the on-screen caption.
 - "query": in English only, used to search English-language stock footage.
 - "hashtags": in English, lowercase.
 
@@ -190,13 +211,14 @@ Return ONLY valid JSON in exactly this shape, no extra commentary:
   "title": "short catchy title in Roman Urdu, under 8 words",
   "hashtags": ["5 to 8 relevant lowercase English hashtags, no # symbol"],
   "scenes": [
-    {{"text": "one or two spoken sentences in proper Urdu script", "caption_roman": "the same sentences in Roman Urdu", "query": "2-4 word English stock-footage search term for this sentence"}}
+    {{"text": "one short sentence in proper Urdu script", "caption_roman": "the same sentence in Roman Urdu", "query": "3-6 word specific English stock-footage search phrase"}}
   ]
 }}
 
 Rules:
+{hook_rules}
 {topic_rules}
-- Keep language simple, practical, and conversational, suitable for text-to-speech narration.
+- Keep language simple, conversational, and natural for text-to-speech narration.
 """
     else:
         return f"""{topic_context}
@@ -210,13 +232,14 @@ Return ONLY valid JSON in exactly this shape, no extra commentary:
   "title": "a short catchy title for the video, under 8 words",
   "hashtags": ["5 to 8 relevant lowercase hashtags for this specific video, no # symbol"],
   "scenes": [
-    {{"text": "one or two spoken sentences", "query": "2-4 word English stock-footage search term for this sentence"}}
+    {{"text": "one short spoken sentence", "query": "3-6 word specific stock-footage search phrase"}}
   ]
 }}
 
 Rules:
+{hook_rules}
 {topic_rules}
-- Keep language simple, practical, and conversational, suitable for text-to-speech narration.
+- Keep language simple, conversational, and natural for text-to-speech narration.
 """
 
 
@@ -252,7 +275,6 @@ def generate_script_with_ai(content_type, language, max_attempts=3):
 
             raw_text = getattr(response, "text", None)
             if not raw_text:
-                # Often means the response was empty or blocked by safety filters
                 raise ValueError(
                     f"Empty response from Gemini (prompt_feedback={getattr(response, 'prompt_feedback', None)})"
                 )
@@ -280,21 +302,142 @@ def generate_script_with_ai(content_type, language, max_attempts=3):
             last_error = e
             print(f"[Attempt {attempt}/{max_attempts}] Gemini script generation failed: {type(e).__name__}: {e}")
             if attempt < max_attempts:
-                time.sleep(3 * attempt)  # brief backoff before retrying
+                time.sleep(3 * attempt)
 
     print(f"All {max_attempts} Gemini attempts failed, using fallback script. Last error: {last_error}")
     return FALLBACK_SCRIPTS[content_type][language]
 
 
-def apply_zoom(clip, duration, zoom_ratio=0.15):
-    """Subtle Ken Burns style zoom-in over the clip's duration, so the
-    background feels alive instead of a static shot. Cheap production-value
-    boost, no extra API/cost involved."""
-    try:
-        def zoom_factor(t):
-            return 1 + zoom_ratio * (t / duration)
+# ----------------------------------------------------------------------------
+# Voice (edge-tts, free)
+# ----------------------------------------------------------------------------
 
-        zoomed = clip.resized(zoom_factor)
+async def _edge_tts_save(text, voice, rate, out_path):
+    communicate = edge_tts.Communicate(text, voice, rate=rate)
+    await communicate.save(out_path)
+
+
+def synthesize_speech(text, language, out_path, attempts=3):
+    """Generate narration with edge-tts and save it as an .mp3. Retries a few
+    times because the free endpoint occasionally hiccups on CI runners."""
+    voice = VOICES.get(language, VOICES["en"])
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            asyncio.run(_edge_tts_save(text, voice, NARRATION_RATE, out_path))
+            if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                return out_path
+            raise ValueError("edge-tts produced an empty audio file")
+        except Exception as e:
+            last_error = e
+            print(f"[TTS attempt {attempt}/{attempts}] failed: {type(e).__name__}: {e}")
+            time.sleep(2 * attempt)
+    raise RuntimeError(f"edge-tts failed after {attempts} attempts: {last_error}")
+
+
+# ----------------------------------------------------------------------------
+# Stock footage (Pexels -> Pixabay fallback)
+# ----------------------------------------------------------------------------
+
+def search_pexels(query):
+    if not PEXELS_KEY:
+        return []
+    try:
+        resp = requests.get(
+            "https://api.pexels.com/videos/search",
+            headers={"Authorization": PEXELS_KEY},
+            params={"query": query, "per_page": 8, "orientation": "portrait"},
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            print(f"Pexels returned status {resp.status_code} for '{query}': {resp.text[:150]}")
+            return []
+        results = []
+        for v in resp.json().get("videos", []):
+            if v.get("duration", 0) < 3:
+                continue
+            files = [f for f in v.get("video_files", []) if f.get("file_type") == "video/mp4" and f.get("width")]
+            if not files:
+                continue
+            # Prefer the smallest file that is still >= 720p (fast download on CI)
+            good = [f for f in files if min(f["width"], f.get("height") or f["width"]) >= 720]
+            pick = (min(good, key=lambda f: f["width"] * (f.get("height") or 0))
+                    if good else max(files, key=lambda f: f["width"]))
+            results.append((f"pexels:{v['id']}", pick["link"]))
+        return results
+    except Exception as e:
+        print(f"Pexels search failed for '{query}': {type(e).__name__}: {e}")
+        return []
+
+
+def search_pixabay(query):
+    if not PIXABAY_KEY:
+        return []
+    try:
+        resp = requests.get(
+            "https://pixabay.com/api/videos/",
+            params={"key": PIXABAY_KEY, "q": query[:100], "per_page": 10, "safesearch": "true"},
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            print(f"Pixabay returned status {resp.status_code} for '{query}': {resp.text[:150]}")
+            return []
+        results = []
+        for hit in resp.json().get("hits", []):
+            if hit.get("duration", 0) < 3:
+                continue
+            vids = hit.get("videos", {})
+            for size in ("large", "medium", "small"):
+                v = vids.get(size)
+                if v and v.get("url"):
+                    results.append((f"pixabay:{hit['id']}", v["url"]))
+                    break
+        return results
+    except Exception as e:
+        print(f"Pixabay search failed for '{query}': {type(e).__name__}: {e}")
+        return []
+
+
+def find_candidates(query):
+    """Pexels first, Pixabay as fallback, then a shortened query on both."""
+    queries = [query]
+    short = " ".join(query.split()[:2])
+    if short and short != query:
+        queries.append(short)
+
+    candidates = []
+    for q in queries:
+        candidates += search_pexels(q)
+        if len(candidates) < 2:
+            candidates += search_pixabay(q)
+        if candidates:
+            break
+        time.sleep(0.5)
+    return [c for c in candidates if c[0] not in USED_CLIP_IDS]
+
+
+def download_video(url, path):
+    with requests.get(url, stream=True, timeout=30) as r:
+        r.raise_for_status()
+        with open(path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1 << 20):
+                f.write(chunk)
+    if os.path.getsize(path) < 10_000:
+        raise ValueError("Downloaded video file is too small")
+
+
+def apply_zoom(clip, duration, zoom_in=True, zoom_ratio=0.18):
+    """Smooth, eased Ken Burns zoom. Alternates zoom-in / zoom-out per scene
+    so consecutive shots never feel the same."""
+    def ease(p):
+        return p * p * (3 - 2 * p)
+
+    def scale(t):
+        p = ease(min(max(t / duration, 0.0), 1.0))
+        return 1 + zoom_ratio * (p if zoom_in else (1 - p))
+
+    try:
+        zoomed = clip.resized(scale)
         return CompositeVideoClip(
             [zoomed.with_position("center")], size=(WIDTH, HEIGHT)
         ).with_duration(duration)
@@ -304,67 +447,91 @@ def apply_zoom(clip, duration, zoom_ratio=0.15):
 
 
 def fetch_clip(query, duration_needed, index):
-    headers = {"Authorization": PEXELS_KEY}
-    url = "https://api.pexels.com/videos/search?query=" + query + chr(38) + "per_page=1"
     video_file = f"bg_{index}.mp4"
+    candidates = find_candidates(query)
 
-    for attempt in range(3):
+    for clip_id, url in candidates[:3]:
         try:
-            time.sleep(1)
-            resp = requests.get(url, headers=headers, timeout=10)
-            if resp.status_code == 200 and resp.json().get("videos"):
-                v_files = resp.json()["videos"][0]["video_files"]
-                hd_file = max(v_files, key=lambda x: x.get("width", 0))
-                with open(video_file, "wb") as vf:
-                    vf.write(requests.get(hd_file["link"], timeout=15).content)
-                clip = VideoFileClip(video_file).without_audio()
-                w, h = clip.size
-                scale = HEIGHT / h
-                new_w = int(w * scale)
-                clip = clip.resized((new_w, HEIGHT))
-                x1 = (new_w - WIDTH) // 2
-                clip = clip.cropped(x1=x1, y1=0, x2=x1 + WIDTH, y2=HEIGHT)
-                clips_list = []
-                cur_dur = 0
-                while cur_dur < duration_needed:
-                    clips_list.append(clip)
-                    cur_dur += clip.duration
-                final_clip = concatenate_videoclips(clips_list).subclipped(0, duration_needed)
-                return apply_zoom(final_clip, duration_needed)
-            else:
-                print(f"Pexels returned status {resp.status_code} for query '{query}': {resp.text[:200]}")
-        except Exception as e:
-            print(f"Attempt {attempt+1} failed for {query}: {e}")
-            time.sleep(2)
+            download_video(url, video_file)
+            clip = VideoFileClip(video_file).without_audio()
+            w, h = clip.size
+            scale = max(HEIGHT / h, WIDTH / w)
+            new_w, new_h = int(round(w * scale)), int(round(h * scale))
+            clip = clip.resized((new_w, new_h))
+            x1, y1 = (new_w - WIDTH) // 2, (new_h - HEIGHT) // 2
+            clip = clip.cropped(x1=x1, y1=y1, x2=x1 + WIDTH, y2=y1 + HEIGHT)
+            clip = clip.with_effects([vfx.MultiplySpeed(SPEED_FACTOR)])
 
+            clips_list, cur_dur = [], 0
+            while cur_dur < duration_needed:
+                clips_list.append(clip)
+                cur_dur += clip.duration
+            final_clip = concatenate_videoclips(clips_list).subclipped(0, duration_needed)
+
+            USED_CLIP_IDS.add(clip_id)
+            return apply_zoom(final_clip, duration_needed, zoom_in=(index % 2 == 0))
+        except Exception as e:
+            print(f"Clip {clip_id} failed for '{query}': {type(e).__name__}: {e}")
+
+    print(f"No usable footage for '{query}', using black background.")
     return ImageClip(np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)).with_duration(duration_needed)
 
 
-def add_caption(bg_clip, caption_text, duration, is_cta=False, chunk_words=4):
-    """Split the caption into short chunks (a few words each) that appear one
-    after another in sync with the scene's audio - a fast-paced style common
-    on high-performing Shorts, instead of one long static sentence sitting on
-    screen the whole time. Falls back to the plain background clip if caption
-    rendering fails for any reason, so the pipeline never crashes."""
-    try:
-        words = caption_text.split()
-        chunks = [" ".join(words[i:i + chunk_words]) for i in range(0, len(words), chunk_words)] or [caption_text]
-        chunk_duration = duration / len(chunks)
+# ----------------------------------------------------------------------------
+# Captions / title
+# ----------------------------------------------------------------------------
 
-        caption_clips = []
+def _text_clip(**kwargs):
+    """TextClip with a small margin so thick strokes aren't clipped; falls
+    back gracefully on MoviePy versions without the margin argument."""
+    try:
+        return TextClip(margin=(30, 30), **kwargs)
+    except TypeError:
+        return TextClip(**kwargs)
+
+
+def split_caption_chunks(text, max_words=2, max_chars=14):
+    """Group words into 1-2 word chunks (long words stay alone)."""
+    chunks, current = [], []
+    for word in text.split():
+        candidate = current + [word]
+        if current and (len(candidate) > max_words or len(" ".join(candidate)) > max_chars):
+            chunks.append(" ".join(current))
+            current = [word]
+        else:
+            current = candidate
+    if current:
+        chunks.append(" ".join(current))
+    return chunks
+
+
+def add_caption(bg_clip, caption_text, duration, is_cta=False):
+    """Fast word-by-word captions, uppercase, centered on screen (y ~ 48%).
+    Chunk length is proportional to its character count so timing roughly
+    follows the speech. Falls back to the plain clip if rendering fails."""
+    try:
+        chunks = split_caption_chunks(caption_text.upper()) or [caption_text.upper()]
+        weights = [len(c) + 2 for c in chunks]
+        total = sum(weights)
+
+        caption_clips, start = [], 0.0
         for idx, chunk in enumerate(chunks):
-            txt_clip = TextClip(
+            chunk_dur = duration * weights[idx] / total
+            txt = _text_clip(
                 font=FONT_PATH,
                 text=chunk,
-                font_size=72 if is_cta else 62,
-                color="yellow" if is_cta else "white",
+                font_size=88 if is_cta else 84,
+                color="yellow" if is_cta else CAPTION_COLORS[idx % len(CAPTION_COLORS)],
                 stroke_color="black",
-                stroke_width=3 if is_cta else 2,
+                stroke_width=7,
                 method="caption",
-                size=(int(WIDTH * 0.85), None),
+                size=(int(WIDTH * 0.88), None),
                 text_align="center",
-            ).with_duration(chunk_duration).with_start(idx * chunk_duration).with_position(("center", int(HEIGHT * 0.72)))
-            caption_clips.append(txt_clip)
+            )
+            y = int(HEIGHT * CAPTION_Y_RATIO - txt.h / 2)
+            txt = txt.with_duration(chunk_dur).with_start(start).with_position(("center", y))
+            caption_clips.append(txt)
+            start += chunk_dur
 
         return CompositeVideoClip([bg_clip] + caption_clips, size=(WIDTH, HEIGHT)).with_duration(duration)
     except Exception as e:
@@ -372,34 +539,37 @@ def add_caption(bg_clip, caption_text, duration, is_cta=False, chunk_words=4):
         return bg_clip
 
 
-def add_title_flash(scene_clip, title_text, flash_duration=1.5):
-    """Overlay a big bold title card for the first ~1.5 seconds of the very
-    first scene, as a stronger scroll-stopping hook. Falls back to the plain
-    scene clip if anything goes wrong."""
+def add_title_flash(scene_clip, title_text, flash_duration=1.8):
+    """Big bold title card near the top for the first ~1.8s of the first scene
+    (kept above center so it never collides with the word-by-word captions)."""
     try:
         flash_len = min(flash_duration, scene_clip.duration)
-        title_clip = TextClip(
+        title_clip = _text_clip(
             font=FONT_PATH,
             text=title_text.upper(),
-            font_size=80,
+            font_size=70,
             color="white",
             stroke_color="black",
-            stroke_width=4,
+            stroke_width=6,
             method="caption",
-            size=(int(WIDTH * 0.9), None),
+            size=(int(WIDTH * 0.88), None),
             text_align="center",
-        ).with_duration(flash_len).with_position(("center", "center"))
-
+        )
+        y = int(HEIGHT * 0.20 - title_clip.h / 2)
+        title_clip = title_clip.with_duration(flash_len).with_position(("center", y))
         return CompositeVideoClip([scene_clip, title_clip], size=(WIDTH, HEIGHT)).with_duration(scene_clip.duration)
     except Exception as e:
         print(f"Title flash failed: {e}")
         return scene_clip
 
 
+# ----------------------------------------------------------------------------
+# Audio extras: music + SFX
+# ----------------------------------------------------------------------------
+
 def add_background_music(narration_audio, duration):
-    """Mix a quiet, looped royalty-free track under the narration. Put a few
-    .mp3 files in a 'music' folder in the repo - one is picked at random each
-    run. If the folder is missing or empty, narration plays with no music."""
+    """Mix a quiet, looped royalty-free track under the narration. If the
+    'music' folder is missing or empty, narration plays with no music."""
     if not os.path.isdir(MUSIC_DIR):
         print("No 'music' folder found, skipping background music.")
         return narration_audio
@@ -413,19 +583,60 @@ def add_background_music(narration_audio, duration):
         track_path = os.path.join(MUSIC_DIR, random.choice(tracks))
         music = AudioFileClip(track_path)
 
-        loop_clips = []
-        cur_dur = 0
+        loop_clips, cur_dur = [], 0
         while cur_dur < duration:
             loop_clips.append(music)
             cur_dur += music.duration
         music_full = concatenate_audioclips(loop_clips).subclipped(0, duration)
-        music_quiet = music_full.with_volume_scaled(0.15)  # keep narration clearly audible
+        music_quiet = music_full.with_volume_scaled(0.12)
 
         return CompositeAudioClip([narration_audio, music_quiet])
     except Exception as e:
         print(f"Background music failed, continuing without it: {e}")
         return narration_audio
 
+
+def add_sfx_transitions(audio, transition_times, duration):
+    """Overlay a short whoosh at every scene transition if an 'sfx' folder
+    with audio files exists (e.g. sfx/whoosh.mp3). Silently skipped otherwise."""
+    if not os.path.isdir(SFX_DIR):
+        print("No 'sfx' folder found, skipping transition sounds.")
+        return audio
+
+    files = [f for f in os.listdir(SFX_DIR) if f.lower().endswith((".mp3", ".wav", ".m4a"))]
+    if not files:
+        print("'sfx' folder is empty, skipping transition sounds.")
+        return audio
+
+    # Prefer a file called whoosh*, otherwise pick any
+    preferred = [f for f in files if f.lower().startswith("whoosh")]
+    sfx_path = os.path.join(SFX_DIR, random.choice(preferred or files))
+
+    try:
+        layers = [audio]
+        for t in transition_times:
+            if t <= 0 or t >= duration:
+                continue
+            sfx = AudioFileClip(sfx_path)
+            sfx = sfx.subclipped(0, min(1.0, sfx.duration)).with_volume_scaled(0.45)
+            start = max(t - 0.12, 0)  # land slightly before the cut
+            layers.append(sfx.with_start(start))
+        return CompositeAudioClip(layers)
+    except Exception as e:
+        print(f"SFX overlay failed, continuing without it: {e}")
+        return audio
+
+
+def silence_clip(duration):
+    def frame(t):
+        t = np.asarray(t)
+        return np.zeros((*t.shape, 2))
+    return AudioClip(frame, duration=duration, fps=44100)
+
+
+# ----------------------------------------------------------------------------
+# YouTube
+# ----------------------------------------------------------------------------
 
 def get_youtube_client():
     """Build an authenticated YouTube API client from the TOKEN_JSON and
@@ -517,60 +728,70 @@ def update_tracker(video_id, title, content_type, language):
         json.dump(data, f, indent=2)
 
 
+# ----------------------------------------------------------------------------
+# Main pipeline
+# ----------------------------------------------------------------------------
+
 def generate_video():
-    target_duration = round(random.uniform(MIN_DURATION, MAX_DURATION), 1)
     content_type, language = get_run_config()
 
     script = generate_script_with_ai(content_type, language)
-    title = script["title"]  # already Roman Urdu for ur runs, English for en runs
+    title = script["title"]  # Roman Urdu for ur runs, English for en runs
     cta_scene = CTA_SCENE_UR if language == "ur" else CTA_SCENE_EN
     scenes = list(script["scenes"]) + [cta_scene]
-    tts_lang = "ur" if language == "ur" else "en"
 
-    print(f"Content type: {content_type} | Language: {language} | Topic: {title} | Target duration: {target_duration}s")
+    print(f"Content type: {content_type} | Language: {language} | Topic: {title} | "
+          f"Duration window: {MIN_DURATION}-{MAX_DURATION}s | Speed: {SPEED_FACTOR}x")
 
     audio_clips = []
     video_clips = []
     for i, scene in enumerate(scenes):
         fname = f"part_{i}.mp3"
-        gTTS(text=scene["text"], lang=tts_lang).save(fname)  # "text" is always proper-script for correct pronunciation
+        synthesize_speech(scene["text"], language, fname)  # "text" is always proper-script for correct pronunciation
         aclip = AudioFileClip(fname)
         audio_clips.append(aclip)
 
         bg_clip = fetch_clip(scene["query"], aclip.duration, i)
-        # on-screen caption: explicit "caption" (CTA) > "caption_roman" (Urdu scenes) > "text" (English scenes)
+        # on-screen caption: explicit "caption" (CTA) > "caption_roman" (Urdu) > "text" (English)
         caption_text = scene.get("caption") or scene.get("caption_roman") or scene["text"]
         scene_clip = add_caption(bg_clip, caption_text, aclip.duration, is_cta=scene.get("cta", False))
         if i == 0:
             scene_clip = add_title_flash(scene_clip, title)
         video_clips.append(scene_clip)
 
+    # Scene transition timestamps (for SFX)
+    transition_times, t = [], 0.0
+    for a in audio_clips[:-1]:
+        t += a.duration
+        transition_times.append(t)
+
     final_audio = concatenate_audioclips(audio_clips)
     final_video = concatenate_videoclips(video_clips)
-
     current_duration = min(final_audio.duration, final_video.duration)
 
-    if current_duration > target_duration:
-        final_audio = final_audio.subclipped(0, target_duration)
-        final_video = final_video.subclipped(0, target_duration)
-    elif current_duration < target_duration:
-        pad = target_duration - current_duration
-        silence = AudioClip(lambda t: 0, duration=pad, fps=44100)
-        final_audio = concatenate_audioclips([final_audio, silence])
-
+    if current_duration > MAX_DURATION:
+        final_audio = final_audio.subclipped(0, MAX_DURATION)
+        final_video = final_video.subclipped(0, MAX_DURATION)
+    elif current_duration < MIN_DURATION:
+        pad = MIN_DURATION - current_duration
+        final_audio = concatenate_audioclips([final_audio, silence_clip(pad)])
         last_frame = final_video.get_frame(max(final_video.duration - 0.04, 0))
-        freeze = ImageClip(last_frame).with_duration(pad)
-        final_video = concatenate_videoclips([final_video, freeze])
+        final_video = concatenate_videoclips([final_video, ImageClip(last_frame).with_duration(pad)])
 
     final_duration = min(final_audio.duration, final_video.duration)
     final_audio = final_audio.subclipped(0, final_duration)
     final_video = final_video.subclipped(0, final_duration)
 
     final_audio = add_background_music(final_audio, final_duration)
+    final_audio = add_sfx_transitions(final_audio, transition_times, final_duration)
+    final_audio = final_audio.with_duration(final_duration)
 
     final = final_video.with_audio(final_audio)
     output_path = "final_short.mp4"
-    final.write_videofile(output_path, fps=30, codec="libx264", audio_codec="aac", bitrate="5000k")
+    final.write_videofile(
+        output_path, fps=30, codec="libx264", audio_codec="aac",
+        bitrate="5000k", preset="veryfast", threads=4,
+    )
 
     if content_type == "ai_tips":
         base_tags = ["ai", "aitips", "chatgpt", "productivity", "shorts"]
