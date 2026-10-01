@@ -1,20 +1,28 @@
 import os
+import io
 import json
+import math
+import bisect
 import random
 import time
 import asyncio
+import urllib.parse
 from datetime import datetime, timezone
 
 import requests
 import numpy as np
 import PIL.Image
-if not hasattr(PIL.Image, "ANTIALIAS"): PIL.Image.ANTIALIAS = PIL.Image.Resampling.LANCZOS
+import PIL.ImageOps
+
+# Compatibility fix for Pillow & MoviePy
+if not hasattr(PIL.Image, "ANTIALIAS"):
+    PIL.Image.ANTIALIAS = PIL.Image.Resampling.LANCZOS
+
 import edge_tts
-from gtts import gTTS  # kept only as an emergency fallback if edge-tts fails
 from moviepy import (
-    VideoFileClip, AudioFileClip, ImageClip, concatenate_videoclips,
+    AudioFileClip, ImageClip, VideoClip, concatenate_videoclips,
     concatenate_audioclips, TextClip, CompositeVideoClip, AudioClip,
-    CompositeAudioClip
+    CompositeAudioClip, afx
 )
 
 from google import genai
@@ -25,32 +33,69 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
+# ----------------------------------------------------------------------------
+# Settings
+# ----------------------------------------------------------------------------
 WIDTH, HEIGHT = 1080, 1920
-MIN_DURATION = 30.0
-MAX_DURATION = 40.0  # each video's final length is picked randomly between these
-PEXELS_KEY = os.environ.get("PEXELS_API_KEY")
+GEN_W, GEN_H = 720, 1280            # size requested from the image AI (faster, more reliable); upscaled to final
+MIN_DURATION = 20.0                 # padded only if the natural length is shorter
+MAX_DURATION = 40.0                 # trimmed only if the natural length is longer
+
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
-GEMINI_MODEL = "gemini-3.1-flash-lite"  # cheap + fast, plenty for short scripts, free-tier friendly
+GEMINI_MODEL = "gemini-3.1-flash-lite"
+POLLINATIONS_TOKEN = os.environ.get("POLLINATIONS_TOKEN")      # optional free token (fewer rate-limit errors)
 
-# Microsoft Edge's free neural TTS voice (no API key, no account, no cost).
-# Browse more options with: edge-tts --list-voices
-# A few good English narrator picks: en-US-AndrewNeural (male), en-US-GuyNeural
-# (male), en-US-AriaNeural (female), en-US-EmmaNeural (female).
 EDGE_TTS_VOICE = os.environ.get("EDGE_TTS_VOICE", "en-US-AndrewNeural")
+EDGE_TTS_RATE = os.environ.get("EDGE_TTS_RATE", "+12%")
+EDGE_TTS_PITCH = os.environ.get("EDGE_TTS_PITCH", "+4Hz")      # slightly brighter = friendlier mascot voice
 
-TRACKER_FILE = "upload_tracker.json"
-MUSIC_DIR = "music"  # put a few royalty-free .mp3 files here; one is picked at random each run
+CAPTIONS_ENABLED = os.environ.get("CAPTIONS", "1") != "0"       # set CAPTIONS=0 to turn captions off
+USE_CUTOUT = os.environ.get("USE_CUTOUT", "1") != "0"           # "talking" effect (needs rembg, optional)
+REMBG_MODEL = os.environ.get("REMBG_MODEL", "u2netp")
 
-# YouTube category per content type (Education fits AI tips; Science & Tech
-# fits "did you know" facts better than the old one-size-fits-all Education).
+TRACKER_FILE = "upload_tracker_cartoon.json"   # separate from the other channel's tracker
+MUSIC_DIR = "music"
+SFX_DIR = "sfx"
+
 CATEGORY_IDS = {"ai_tips": "27", "random": "28"}
-
-# Font used for on-screen captions (installed via apt in the workflow: fonts-dejavu-core).
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
-# One run every 4 hours (UTC). The channel is AI-learning only now, so every
-# slot is "ai_tips". Update your workflow's cron to '0 */4 * * *' to match.
-# Want more videos per day? Add more hours below and update the cron too.
+CAPTION_Y_RATIO = 0.48              # screen center: never hidden behind the Shorts UI
+CAPTION_COLORS = ["white", "yellow"]
+
+# Visual style presets. Change with VIDEO_STYLE=clay|anime (env var). Same mascot in every video = brand.
+STYLE_PRESETS = {
+    "clay": {
+        "style": ("cute claymation style, handmade plasticine clay texture, soft fingerprints, "
+                  "stop-motion look, soft studio lighting, vibrant colors, highly detailed"),
+        "mascot": ("Bulby, a cute round clay lightbulb character with big friendly eyes, a glowing warm "
+                   "yellow body, tiny arms and legs, and a cheerful smile"),
+    },
+    "anime": {
+        "style": ("hand-painted dreamy anime film style, soft watercolor backgrounds, warm gentle light, "
+                  "vibrant colors, highly detailed"),
+        "mascot": ("Bulby, a cute round glowing lightbulb spirit with big friendly eyes, tiny arms and "
+                   "legs, and a cheerful smile"),
+    },
+}
+VIDEO_STYLE = os.environ.get("VIDEO_STYLE", "clay")
+_PRESET = STYLE_PRESETS.get(VIDEO_STYLE, STYLE_PRESETS["clay"])
+IMAGE_STYLE = _PRESET["style"] + ", vertical composition"
+MASCOT = os.environ.get("MASCOT_DESC", _PRESET["mascot"])
+IMAGE_NEGATIVE = "no text, no letters, no words, no watermark, no logo"
+
+FRAMING = {
+    "wide": "medium shot, the character centered and fully visible, simple uncluttered colorful background",
+    "close": "close-up of the character's face and upper body, centered, expressive emotion, simple uncluttered background",
+}
+
+# Camera / motion tuning
+ZOOM_AMT = 0.14        # extra zoom over the length of a shot
+DRIFT = 40             # sideways drift in pixels
+PUNCH_AMT = 0.025      # tiny "punch" zoom each time a new caption word appears
+PUNCH_LEN = 0.14       # seconds
+ENV_FPS = 30           # audio-loudness envelope resolution
+
 RUN_SCHEDULE = {
     0: "ai_tips",
     4: "ai_tips",
@@ -60,47 +105,49 @@ RUN_SCHEDULE = {
     20: "ai_tips",
 }
 
+LAST_GOOD_IMAGE = None
+_CUTOUT_CACHE = {}
+_REMBG_SESSION = None
+_REMBG_FAILED = False
+
 
 def get_run_config():
-    """Decide today's content type from the UTC hour. Snaps to the nearest
-    scheduled hour so a slightly delayed workflow run (common with GitHub
-    Actions cron) still picks a sensible slot instead of crashing."""
     hour = datetime.now(timezone.utc).hour
     closest_hour = min(RUN_SCHEDULE.keys(), key=lambda h: min(abs(hour - h), 24 - abs(hour - h)))
     return RUN_SCHEDULE[closest_hour]
 
 
 CTA_SCENE = {
-    "text": "If this blew your mind, hit that subscribe button and turn on notifications, because we post brand new videos every single day.",
-    "query": "colorful nebula space bright",
+    "text": "Comment which AI trick you want next, and follow for more!",
+    "queries": ["waving happily at the camera with a big smile, confetti in the air"],
     "cta": True,
-    "caption": "SUBSCRIBE FOR MORE!",
 }
 
-# Used only if AI script generation fails, so the pipeline never crashes.
 FALLBACK_SCRIPTS = {
-    "random": {
-        "title": "Space is Completely Silent",
-        "hashtags": ["space", "facts", "didyouknow", "science", "universe"],
-        "scenes": [
-            {"text": "Did you know that space is completely silent?", "query": "deep space cosmos silence"},
-            {"text": "Sound waves require a medium like air to travel, and because space is a vacuum, molecules are too far apart to carry sound.", "query": "space vacuum stars"},
-            {"text": "If you screamed in space, no one would hear you.", "query": "astronaut floating space"},
-            {"text": "This eerie silence stretches across the entire universe, making the cosmos both breathtaking and strangely terrifying.", "query": "galaxy spinning nebula"},
-        ],
-    },
     "ai_tips": {
-        "title": "This One Prompt Trick Changes Everything",
-        "hashtags": ["ai", "aitips", "chatgpt", "prompting", "productivity"],
+        "title": "You're Using ChatGPT Wrong",
+        "hashtags": ["ai", "aitips", "chatgpt", "animation", "productivity"],
         "scenes": [
-            {"text": "Most people use AI chatbots completely wrong, and it's costing them much better answers.", "query": "person typing laptop screen"},
-            {"text": "Here's a simple trick: instead of just asking a question, show the AI an example of what you want first.", "query": "hands typing keyboard closeup"},
-            {"text": "This is called few shot prompting, and it works because AI learns better from examples than from instructions alone.", "query": "digital technology abstract lights"},
-            {"text": "Try this in your very next chat with any AI tool, and watch how much better the answer gets.", "query": "smartphone chat app screen"},
+            {"text": "You're using AI chatbots wrong, and it costs you better answers.",
+             "queries": ["sitting at a glowing computer looking confused in a cozy room",
+                         "confused face with a question mark above its head"]},
+            {"text": "Here's the fix: show the AI an example of what you want first.",
+             "queries": ["holding a glowing example card next to a friendly robot in a bright classroom",
+                         "excited face, eyes wide, pointing upward"]},
+            {"text": "This is called few shot prompting, and AI learns faster from examples.",
+             "queries": ["pointing at a colorful chalkboard with simple shapes in a classroom",
+                         "proud smiling face with sparkles around"]},
+            {"text": "Try it in your next chat, and watch the answers get better.",
+             "queries": ["holding a futuristic phone with glowing bright light in a neon city",
+                         "happy surprised face with shining eyes"]},
         ],
     },
 }
 
+
+# ----------------------------------------------------------------------------
+# Tracker / topics
+# ----------------------------------------------------------------------------
 
 def _read_tracker():
     if not os.path.exists(TRACKER_FILE):
@@ -114,13 +161,9 @@ def _read_tracker():
 
 
 def get_past_titles(limit=100):
-    """Read titles of previously uploaded videos, so we can ask the AI to
-    avoid repeating the same topic."""
     return [e.get("title", "") for e in _read_tracker()[-limit:] if e.get("title")]
 
 
-# Rotating angles for the AI-learning channel, so consecutive videos don't
-# all feel like the same template.
 AI_SUBTOPICS = [
     "writing better prompts (prompt techniques and formulas)",
     "using AI to boost productivity and save time at work",
@@ -138,95 +181,83 @@ AI_SUBTOPICS = [
 
 
 def pick_subtopic():
-    """Pick the AI subtopic used least recently (by the tracker history), so
-    the channel cycles through every angle before repeating one. Falls back
-    to a random pick if there's no history yet."""
     history = [e.get("subtopic") for e in _read_tracker() if e.get("subtopic")]
-    last_used = {}
-    for idx, sub in enumerate(history):
-        last_used[sub] = idx
-    # Never-used subtopics (index -1) come first; ties broken randomly.
+    last_used = {sub: idx for idx, sub in enumerate(history)}
     candidates = sorted(AI_SUBTOPICS, key=lambda t: (last_used.get(t, -1), random.random()))
     return candidates[0]
 
 
+# ----------------------------------------------------------------------------
+# Script generation (Gemini)
+# ----------------------------------------------------------------------------
+
 def build_prompt(content_type, avoid_text, subtopic=None):
-    topic_rules_ai = """- 4 to 6 scenes total.
-- Teach ONE genuinely useful, concrete AI tip, trick, or concept per video (e.g. a prompting technique, a way to save time, a common mistake to avoid, or a simple explanation of how AI works).
-- All scenes combined should read aloud in about 22-30 seconds (roughly 60-85 words total).
-- The very first sentence must be a bold, scroll-stopping hook - a surprising claim, mistake, or question - written to stop someone mid-scroll in the first 2 seconds. Then explain the tip clearly, then give one short concrete example.
-- Each "query" must describe generic, vivid, specific stock video footage (people using devices, offices, technology, abstract digital visuals) - never named apps' logos or real people - so it closely matches the sentence and can be found on a stock footage site.
-- hashtags should mix a couple of broad/high-traffic tags (like "ai", "shorts") with a few specific to this exact tip, to help discovery."""
-
-    topic_rules_random = """- 4 to 6 scenes total.
-- All scenes combined should read aloud in about 22-30 seconds (roughly 60-85 words total).
-- The very first sentence must be a bold, scroll-stopping hook - a surprising claim or question - written to stop someone mid-scroll in the first 2 seconds. Then the rest should flow like a mini story with build-up and a surprising payoff.
-- Each "query" must describe generic, vivid, specific stock video footage (nature, objects, places, animals) - never named people or brands - so it closely matches the sentence and can be found on a stock footage site.
-- hashtags should mix a couple of broad/high-traffic tags (like "shorts", "facts") with a few specific to this exact topic, to help discovery."""
-
-    topic_context = (
-        """You write short, punchy scripts for a YouTube Shorts channel
-that teaches everyday people practical AI tips, tricks, and beginner concepts
-for using AI chatbots and tools (like ChatGPT, Gemini, Claude, or similar) in
-daily life, work, or study. Assume the viewer is a curious beginner, not a
-programmer."""
-        if content_type == "ai_tips" else
-        """You write short, punchy scripts for a "did you know" style
-YouTube Shorts channel about surprising true facts (space, science, history,
-psychology, nature, animals, or the human body - pick ONE topic at random,
-something genuinely surprising and different each time)."""
-    )
-    topic_rules = topic_rules_ai if content_type == "ai_tips" else topic_rules_random
-
-    subtopic_text = (
-        f"Focus this video on this angle: {subtopic}." if subtopic and content_type == "ai_tips" else ""
-    )
-
-    return f"""{topic_context}
-
-{subtopic_text}
-
+    focus = f"Focus on: {subtopic}" if subtopic else ""
+    return f"""You write short, punchy scripts for a YouTube Shorts channel where Bulby, a cute talking lightbulb
+mascot, teaches everyday people (kids, teens and adults) practical AI tips. Bulby speaks directly to the
+viewer in a friendly, energetic, slightly funny voice. No jargon.
+{focus}
 {avoid_text}
 
-Write the "title" and every scene's "text" in English.
+SCRIPT RULES:
+- HOOK: the first sentence is a bold, surprising CLAIM or STATEMENT of max 12 words that makes people NEED to hear the rest (e.g. "You're using ChatGPT wrong, and it's costing you hours."). NEVER open with a question. NEVER start with "Did you know", "Have you ever", "What if", "Imagine", "Hi", "Hey", or any greeting/intro.
+- 4 to 5 scenes. Each scene is ONE short sentence of 6 to 14 words (short sentences = fast cuts = better retention).
+- About 45-60 words in total. Teach ONE concrete, useful tip and include one specific, copy-able example (an exact phrase the viewer can try).
+- The LAST sentence should connect back to the hook so the video loops naturally when replayed.
+- Do NOT add a subscribe/follow call-to-action; it is added automatically.
 
-Return ONLY valid JSON in exactly this shape, no extra commentary:
+IMAGE RULES (each scene shows Bulby in 2 AI-generated shots):
+- "queries" has EXACTLY 2 items per scene: [1] a medium shot of what Bulby is doing + the setting, [2] a close-up of Bulby's face showing a clear emotion that matches the sentence.
+- NEVER describe Bulby's appearance (it is added automatically). Describe only actions, setting, mood and props.
+- Make every scene a different place and color mood. Never ask for text, letters, logos, or screens with readable writing. Each query under 25 words.
+
+Return ONLY valid JSON in exactly this shape:
 {{
-  "title": "a short catchy title for the video, under 8 words",
-  "hashtags": ["5 to 8 relevant lowercase hashtags for this specific video, no # symbol"],
+  "title": "curiosity-driven title under 8 words",
+  "hashtags": ["5 to 8 relevant lowercase hashtags, no # symbol"],
   "scenes": [
-    {{"text": "one or two spoken sentences", "query": "2-4 word English stock-footage search term for this sentence"}}
+    {{"text": "one short spoken sentence", "queries": ["medium shot: action + setting", "close-up: face + emotion"]}}
   ]
 }}
-
-Rules:
-{topic_rules}
-- Keep language simple, practical, and conversational, suitable for text-to-speech narration.
 """
+
+
+def validate_script(data):
+    if not isinstance(data, dict) or not data.get("title") or not data.get("scenes"):
+        raise ValueError("JSON missing 'title' or 'scenes'")
+    for scene in data["scenes"]:
+        if not scene.get("text"):
+            raise ValueError("A scene is missing 'text'")
+        queries = scene.get("queries")
+        if isinstance(queries, str):
+            queries = [queries]
+        if not queries and scene.get("query"):
+            queries = [scene["query"]]
+        queries = [q for q in (queries or []) if isinstance(q, str) and q.strip()]
+        if not queries:
+            raise ValueError("A scene is missing image 'queries'")
+        scene["queries"] = queries[:2]
+    first = data["scenes"][0]["text"].strip()
+    if first.endswith("?") or first.lower().startswith(("did you know", "have you ever", "what if", "imagine", "hi", "hey")):
+        raise ValueError(f"Weak hook: {first[:60]}")
+    data.setdefault("hashtags", [])
 
 
 def generate_script_with_ai(content_type, subtopic=None, max_attempts=3):
     if not GEMINI_KEY:
         print("GEMINI_API_KEY not set, using fallback script.")
-        return FALLBACK_SCRIPTS[content_type]
+        return FALLBACK_SCRIPTS["ai_tips"]
 
     past_titles = get_past_titles()
-    avoid_text = ""
-    if past_titles:
-        avoid_text = (
-            "Do NOT repeat these topics already covered, pick something different: "
-            + "; ".join(past_titles)
-        )
-
+    avoid_text = f"Do NOT repeat these topics: {'; '.join(past_titles)}" if past_titles else ""
     prompt = build_prompt(content_type, avoid_text, subtopic)
 
     try:
         client = genai.Client(api_key=GEMINI_KEY)
     except Exception as e:
-        print(f"Could not create Gemini client, using fallback script: {type(e).__name__}: {e}")
-        return FALLBACK_SCRIPTS[content_type]
+        print(f"Gemini client error, using fallback: {e}")
+        return FALLBACK_SCRIPTS["ai_tips"]
 
-    last_error = None
     for attempt in range(1, max_attempts + 1):
         try:
             response = client.models.generate_content(
@@ -234,13 +265,9 @@ def generate_script_with_ai(content_type, subtopic=None, max_attempts=3):
                 contents=prompt,
                 config=types.GenerateContentConfig(response_mime_type="application/json"),
             )
-
             raw_text = getattr(response, "text", None)
             if not raw_text:
-                # Often means the response was empty or blocked by safety filters
-                raise ValueError(
-                    f"Empty response from Gemini (prompt_feedback={getattr(response, 'prompt_feedback', None)})"
-                )
+                raise ValueError("Empty response")
 
             cleaned = raw_text.strip()
             if cleaned.startswith("```"):
@@ -249,74 +276,29 @@ def generate_script_with_ai(content_type, subtopic=None, max_attempts=3):
                     cleaned = cleaned[4:].strip()
 
             data = json.loads(cleaned)
-
-            if not data.get("title") or not data.get("scenes"):
-                raise ValueError("AI response JSON is missing 'title' or 'scenes'.")
-            for scene in data["scenes"]:
-                if not scene.get("text") or not scene.get("query"):
-                    raise ValueError("A scene in the AI response is missing 'text' or 'query'.")
-
-            print(f"Gemini script generated successfully on attempt {attempt}/{max_attempts}.")
+            validate_script(data)
+            print(f"Gemini script OK on attempt {attempt}/{max_attempts}.")
             return data
-
         except Exception as e:
-            last_error = e
-            print(f"[Attempt {attempt}/{max_attempts}] Gemini script generation failed: {type(e).__name__}: {e}")
-            if attempt < max_attempts:
-                time.sleep(3 * attempt)  # brief backoff before retrying
+            print(f"[Gemini attempt {attempt}/{max_attempts}] {type(e).__name__}: {e}")
+            time.sleep(2 * attempt)
 
-    print(f"All {max_attempts} Gemini attempts failed, using fallback script. Last error: {last_error}")
-    return FALLBACK_SCRIPTS[content_type]
+    print("All Gemini attempts failed, using fallback script.")
+    return FALLBACK_SCRIPTS["ai_tips"]
 
 
-def score_hook(text):
-    """Cheap heuristic to rate how scroll-stopping an opening line is. Not a
-    substitute for real A/B testing, but a free way to prefer the punchier
-    of two AI-generated candidates instead of always taking the first draft."""
-    text_l = text.lower()
-    score = 0
-    if "?" in text:
-        score += 2
-    if any(ch.isdigit() for ch in text):
-        score += 2
-    power_words = [
-        "secret", "never", "always", "everyone", "nobody", "shocking",
-        "mistake", "wrong", "trick", "truth", "surprising", "insane",
-        "why", "how", "stop", "most people",
-    ]
-    score += sum(1 for w in power_words if w in text_l)
-    word_count = len(text.split())
-    if 6 <= word_count <= 16:  # a hook that's too long or too short lands worse
-        score += 1
-    return score
-
-
-def generate_best_script(content_type, subtopic=None, candidates=2):
-    """Generate a couple of script candidates and keep the one with the
-    strongest hook (first scene's opening line), instead of settling for
-    whatever comes back on the first try. Costs one extra free-tier Gemini
-    call per video."""
-    if not GEMINI_KEY:
-        return FALLBACK_SCRIPTS[content_type]
-
-    best, best_score = None, -1
-    for _ in range(candidates):
-        data = generate_script_with_ai(content_type, subtopic)
-        if data is FALLBACK_SCRIPTS[content_type]:
-            continue  # a fallback isn't a real candidate to compare
-        score = score_hook(data["scenes"][0]["text"])
-        if score > best_score:
-            best, best_score = data, score
-
-    return best if best is not None else FALLBACK_SCRIPTS[content_type]
-
+# ----------------------------------------------------------------------------
+# Voice (edge-tts) with word timings for synced captions
+# ----------------------------------------------------------------------------
 
 async def _edge_tts_save(text, voice, output_path):
-    """Save narration audio and, where available, collect per-word timing
-    from edge-tts's WordBoundary events (used to sync karaoke-style captions
-    exactly to the spoken audio). A bad/missing timing event is skipped
-    rather than failing the whole narration."""
-    communicate = edge_tts.Communicate(text, voice)
+    # edge-tts >= 7 defaults to sentence-level timings; word-level must be requested explicitly.
+    kwargs = {"rate": EDGE_TTS_RATE, "pitch": EDGE_TTS_PITCH}
+    try:
+        communicate = edge_tts.Communicate(text, voice, boundary="WordBoundary", **kwargs)
+    except TypeError:
+        communicate = edge_tts.Communicate(text, voice, **kwargs)
+
     word_timings = []
     with open(output_path, "wb") as f:
         async for chunk in communicate.stream():
@@ -325,247 +307,400 @@ async def _edge_tts_save(text, voice, output_path):
                 f.write(chunk["data"])
             elif ctype == "WordBoundary":
                 try:
-                    start = chunk["offset"] / 1e7  # 100-ns units -> seconds
+                    start = chunk["offset"] / 1e7
                     dur = chunk["duration"] / 1e7
                     word_timings.append({"text": chunk["text"], "start": start, "end": start + dur})
                 except Exception:
-                    pass  # timing is a nice-to-have; don't let a bad entry break narration
+                    pass
     return word_timings
 
 
-def synthesize_speech(text, output_path):
-    """Generate the narration audio using Microsoft Edge's free neural TTS
-    (via the edge-tts library) - no API key, no account, no cost, and much
-    more natural-sounding than gTTS. Returns a list of per-word timings
-    (empty if unavailable) for karaoke-style captions. Falls back to gTTS
-    automatically if edge-tts fails for any reason (no internet, service
-    hiccup) - in that case timing is unavailable and captions fall back to
-    evenly-spaced chunks, so the pipeline never crashes."""
-    try:
-        return asyncio.run(_edge_tts_save(text, EDGE_TTS_VOICE, output_path))
-    except Exception as e:
-        print(f"edge-tts failed, falling back to gTTS: {type(e).__name__}: {e}")
-
-    gTTS(text=text, lang="en").save(output_path)
-    return []
-
-
-def apply_zoom(clip, duration, zoom_ratio=0.15):
-    """Subtle Ken Burns style zoom-in over the clip's duration, so the
-    background feels alive instead of a static shot. Cheap production-value
-    boost, no extra API/cost involved."""
-    try:
-        def zoom_factor(t):
-            return 1 + zoom_ratio * (t / duration)
-
-        zoomed = clip.resized(zoom_factor)
-        return CompositeVideoClip(
-            [zoomed.with_position("center")], size=(WIDTH, HEIGHT)
-        ).with_duration(duration)
-    except Exception as e:
-        print(f"Zoom effect failed, using plain clip: {e}")
-        return clip
-
-
-def fetch_clip(query, duration_needed, index, used_video_ids):
-    """Fetch background footage for a scene. Pulls several results per query
-    (not just the first) and splices together 2-3 different clips the video
-    hasn't already used yet - much more visually dynamic than looping a
-    single shot for the whole scene, and avoids the same footage repeating
-    across different scenes. Falls back to a blank clip if Pexels has
-    nothing usable."""
-    headers = {"Authorization": PEXELS_KEY}
-    url = "https://api.pexels.com/videos/search?query=" + query + chr(38) + "per_page=6"
-
-    candidates = []
-    for attempt in range(3):
+def synthesize_speech(text, output_path, attempts=3):
+    last_error = None
+    for attempt in range(1, attempts + 1):
         try:
-            time.sleep(1)
-            resp = requests.get(url, headers=headers, timeout=10)
-            if resp.status_code == 200 and resp.json().get("videos"):
-                candidates = resp.json()["videos"]
-                break
+            timings = asyncio.run(_edge_tts_save(text, EDGE_TTS_VOICE, output_path))
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                return timings
+            raise ValueError("empty audio file")
+        except Exception as e:
+            last_error = e
+            print(f"[TTS attempt {attempt}/{attempts}] {type(e).__name__}: {e}")
+            time.sleep(2 * attempt)
+    raise RuntimeError(f"edge-tts failed after {attempts} attempts: {last_error}")
+
+
+def audio_envelope(aclip, fps=ENV_FPS):
+    """Loudness per video frame (0..1) used to make the mascot 'talk'."""
+    try:
+        sr = 16000
+        arr = aclip.to_soundarray(fps=sr)
+        mono = np.abs(arr).mean(axis=1) if arr.ndim == 2 else np.abs(arr)
+        step = sr // fps
+        n = len(mono) // step
+        if n < 2:
+            return None
+        env = mono[:n * step].reshape(n, step).mean(axis=1)
+        ref = float(np.percentile(env, 95))
+        if ref <= 1e-6:
+            return None
+        env = np.clip(env / ref, 0.0, 1.0)
+        return np.convolve(env, np.ones(3) / 3, mode="same")
+    except Exception as e:
+        print(f"Audio envelope failed: {e}")
+        return None
+
+
+# ----------------------------------------------------------------------------
+# Images (Pollinations, free)
+# ----------------------------------------------------------------------------
+
+def make_gradient_image(path):
+    top = np.array(random.choice([(88, 40, 200), (20, 120, 220), (220, 70, 140), (30, 170, 150)]), dtype=float)
+    bottom = np.array((15, 15, 40), dtype=float)
+    ratio = np.linspace(0, 1, HEIGHT)[:, None, None]
+    arr = top * (1 - ratio) + bottom * ratio
+    arr = np.repeat(arr, WIDTH, axis=1).astype(np.uint8)
+    PIL.Image.fromarray(arr).save(path, quality=95)
+
+
+def generate_cartoon_image(prompt, out_path, seed, attempts=4):
+    """Free image generation via Pollinations with retries, model switch and validation."""
+    full_prompt = f"{IMAGE_STYLE}, {prompt}, {IMAGE_NEGATIVE}"[:900]
+    encoded = urllib.parse.quote(full_prompt)
+    headers = {"User-Agent": "Mozilla/5.0"}
+    if POLLINATIONS_TOKEN:
+        headers["Authorization"] = f"Bearer {POLLINATIONS_TOKEN}"
+
+    for attempt in range(1, attempts + 1):
+        model = "flux" if attempt <= 2 else "turbo"
+        url = (f"https://image.pollinations.ai/prompt/{encoded}"
+               f"?width={GEN_W}&height={GEN_H}&seed={seed}&model={model}&nologo=true&enhance=false")
+        try:
+            resp = requests.get(url, headers=headers, timeout=120)
+            if resp.status_code == 200 and resp.content:
+                img = PIL.Image.open(io.BytesIO(resp.content)).convert("RGB")
+                if min(img.size) < 256:
+                    raise ValueError(f"image too small: {img.size}")
+                img = PIL.ImageOps.fit(img, (WIDTH, HEIGHT), method=PIL.Image.Resampling.LANCZOS)
+                img.save(out_path, quality=95)
+                return True
+            print(f"[Image attempt {attempt}/{attempts}] status {resp.status_code}")
+        except Exception as e:
+            print(f"[Image attempt {attempt}/{attempts}] {type(e).__name__}: {e}")
+        time.sleep(4 * attempt)
+    return False
+
+
+def get_scene_image(query, kind, index, shot, base_seed):
+    """Returns the path of a usable image for this shot (never raises)."""
+    global LAST_GOOD_IMAGE
+    path = f"cartoon_{index}_{shot}.jpg"
+    prompt = f"{MASCOT}, {query}, {FRAMING[kind]}"
+    if generate_cartoon_image(prompt, path, seed=base_seed + index * 10 + shot):
+        LAST_GOOD_IMAGE = path
+        time.sleep(1.5)  # be gentle with the free API
+        return path
+    if LAST_GOOD_IMAGE:
+        print(f"Scene {index} shot {shot}: image failed, reusing previous image.")
+        return LAST_GOOD_IMAGE
+    print(f"Scene {index} shot {shot}: image failed, using gradient background.")
+    make_gradient_image(path)
+    return path
+
+
+# ----------------------------------------------------------------------------
+# "Talking" cutout (optional, needs rembg) + camera + shots
+# ----------------------------------------------------------------------------
+
+def get_cutout(img_path):
+    """Returns (RGBA cutout of the mascot, (pivot_x, pivot_y)) or None. Fully optional."""
+    global _REMBG_SESSION, _REMBG_FAILED
+    if not USE_CUTOUT or _REMBG_FAILED:
+        return None
+    if img_path in _CUTOUT_CACHE:
+        return _CUTOUT_CACHE[img_path]
+
+    result = None
+    try:
+        import rembg
+        if _REMBG_SESSION is None:
+            _REMBG_SESSION = rembg.new_session(REMBG_MODEL)
+        img = PIL.Image.open(img_path).convert("RGB")
+        out = rembg.remove(img, session=_REMBG_SESSION).convert("RGBA")
+        alpha = np.asarray(out.split()[-1])
+        coverage = float((alpha > 128).mean())
+        bbox = out.getbbox()
+        if bbox and 0.04 < coverage < 0.80:
+            result = (out, ((bbox[0] + bbox[2]) / 2.0, float(bbox[3])))
+        else:
+            print(f"Cutout rejected (coverage={coverage:.2f}), using whole-frame pulse.")
+    except ImportError:
+        print("rembg not installed: using whole-frame pulse instead of cutout.")
+        _REMBG_FAILED = True
+    except Exception as e:
+        print(f"Cutout failed ({type(e).__name__}: {e}), using whole-frame pulse.")
+    _CUTOUT_CACHE[img_path] = result
+    return result
+
+
+def _affine_const():
+    return PIL.Image.Transform.AFFINE if hasattr(PIL.Image, "Transform") else PIL.Image.AFFINE
+
+
+def _bilinear():
+    return PIL.Image.Resampling.BILINEAR if hasattr(PIL.Image, "Resampling") else PIL.Image.BILINEAR
+
+
+def camera_affine(s, cx, cy):
+    """Affine data for a window of size (W/s, H/s) centered at (cx, cy), clamped inside the image."""
+    half_w, half_h = WIDTH / (2 * s), HEIGHT / (2 * s)
+    cx = min(max(cx, half_w), WIDTH - half_w)
+    cy = min(max(cy, half_h), HEIGHT - half_h)
+    return (1 / s, 0, cx - WIDTH / (2 * s), 0, 1 / s, cy - HEIGHT / (2 * s))
+
+
+def _env_value(env, tt):
+    if env is None or len(env) == 0:
+        return 0.0
+    idx = min(max(int(tt * ENV_FPS), 0), len(env) - 1)
+    return float(env[idx])
+
+
+def _punch_value(times, tt):
+    if not times:
+        return 0.0
+    i = bisect.bisect_right(times, tt) - 1
+    if i < 0:
+        return 0.0
+    return PUNCH_AMT * max(0.0, 1.0 - (tt - times[i]) / PUNCH_LEN)
+
+
+def make_shot_clip(img_path, duration, zoom_in, base_zoom, focus_y, env, env_offset, punch_times):
+    """One camera shot: eased zoom + drift + punch zoom on each caption word, and the mascot
+    squashes/stretches/bounces with the loudness of the voice so it looks like it is talking."""
+    bg = PIL.Image.open(img_path).convert("RGBA")
+    if bg.size != (WIDTH, HEIGHT):
+        bg = bg.resize((WIDTH, HEIGHT), _bilinear())
+    cut = get_cutout(img_path)
+    direction = random.choice([-1, 1])
+    affine, bilinear = _affine_const(), _bilinear()
+
+    def progress(t):
+        p = min(max(t / duration, 0.0), 1.0)
+        return p * p * (3 - 2 * p)
+
+    def frame(t):
+        tt = env_offset + t
+        e = _env_value(env, tt)
+        p = progress(t)
+        s = base_zoom * (1.0 + ZOOM_AMT * (p if zoom_in else 1.0 - p))
+        s *= 1.0 + _punch_value(punch_times, tt)
+
+        if cut is None:
+            s *= 1.0 + 0.012 * e
+            comp = bg
+        else:
+            cut_img, (px, py) = cut
+            lift = 16.0 * e + 2.5 * math.sin(tt * 7.5)
+            sy = 1.0 + 0.05 * e
+            sx = 1.0 - 0.02 * e
+            data = (1 / sx, 0, px - px / sx, 0, 1 / sy, py + (lift - py) / sy)
+            fg = cut_img.transform((WIDTH, HEIGHT), affine, data, resample=bilinear)
+            comp = PIL.Image.alpha_composite(bg, fg)
+
+        cx = WIDTH / 2 + direction * DRIFT * (p - 0.5)
+        cy = focus_y * HEIGHT
+        img = comp.transform((WIDTH, HEIGHT), affine, camera_affine(s, cx, cy), resample=bilinear)
+        return np.asarray(img.convert("RGB"))
+
+    try:
+        frame(0.0)  # smoke test
+        return VideoClip(frame_function=frame, duration=duration)
+    except Exception as e:
+        print(f"Shot rendering setup failed ({type(e).__name__}: {e}), using static image.")
+        return ImageClip(np.asarray(bg.convert("RGB"))).with_duration(duration)
+
+
+def build_scene_background(scene, duration, index, base_seed, env, punch_times):
+    queries = scene["queries"]
+    n_shots = 1 if (scene.get("cta") or duration < 2.8) else 2
+    shots, prev_path, elapsed = [], None, 0.0
+
+    for k in range(n_shots):
+        shot_dur = duration / n_shots if k < n_shots - 1 else duration - elapsed
+        same_image = k >= len(queries)  # only one query given: reuse the image as a close-up crop
+        if same_image and prev_path:
+            path, base_zoom, focus_y = prev_path, 1.35, 0.40
+        else:
+            kind = "wide" if k == 0 else "close"
+            path = get_scene_image(queries[min(k, len(queries) - 1)], kind, index, k, base_seed)
+            base_zoom, focus_y = 1.04, 0.5
+        prev_path = path
+        shots.append(make_shot_clip(
+            path, shot_dur, zoom_in=((index + k) % 2 == 0), base_zoom=base_zoom, focus_y=focus_y,
+            env=env, env_offset=elapsed, punch_times=punch_times,
+        ))
+        elapsed += shot_dur
+
+    return shots[0] if len(shots) == 1 else concatenate_videoclips(shots)
+
+
+# ----------------------------------------------------------------------------
+# Captions / title
+# ----------------------------------------------------------------------------
+
+def _text_clip(**kwargs):
+    kwargs.setdefault("font", FONT_PATH if os.path.exists(FONT_PATH) else None)
+    try:
+        return TextClip(margin=(30, 30), **kwargs)
+    except TypeError:
+        return TextClip(**kwargs)
+
+
+def build_caption_segments(caption_text, word_timings, duration, max_words=2, max_chars=14):
+    """[(TEXT, start, end)] in 1-2 word chunks. Uses real word timings when available."""
+    segments = []
+    if word_timings:
+        groups, cur = [], []
+        for w in word_timings:
+            cand = cur + [w]
+            if cur and (len(cand) > max_words or len(" ".join(x["text"] for x in cand)) > max_chars):
+                groups.append(cur)
+                cur = [w]
             else:
-                print(f"Pexels returned status {resp.status_code} for query '{query}': {resp.text[:200]}")
-        except Exception as e:
-            print(f"Attempt {attempt+1} failed for {query}: {e}")
-            time.sleep(2)
-
-    if not candidates:
-        return ImageClip(np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)).with_duration(duration_needed)
-
-    # Prefer clips not already used elsewhere in this video; if the query
-    # just doesn't have enough distinct results, allow reuse rather than fail.
-    fresh = [v for v in candidates if v["id"] not in used_video_ids] or candidates
-
-    # Split the scene into 2-3 different shots for a faster-paced, more
-    # dynamic feel. Skip splitting very short scenes - a cut every <2.5s
-    # looks frantic rather than dynamic.
-    max_segments = 3 if duration_needed >= 7 else (2 if duration_needed >= 4 else 1)
-    chosen = fresh[:min(max_segments, len(fresh))]
-    seg_duration = duration_needed / len(chosen)
-
-    segment_clips = []
-    for seg_idx, video in enumerate(chosen):
-        used_video_ids.add(video["id"])
-        video_file = f"bg_{index}_{seg_idx}.mp4"
-        try:
-            v_files = video["video_files"]
-            hd_file = max(v_files, key=lambda x: x.get("width", 0))
-            with open(video_file, "wb") as vf:
-                vf.write(requests.get(hd_file["link"], timeout=15).content)
-            clip = VideoFileClip(video_file).without_audio()
-            w, h = clip.size
-            scale = HEIGHT / h
-            new_w = int(w * scale)
-            clip = clip.resized((new_w, HEIGHT))
-            x1 = (new_w - WIDTH) // 2
-            clip = clip.cropped(x1=x1, y1=0, x2=x1 + WIDTH, y2=HEIGHT)
-
-            loop_clips = []
-            cur_dur = 0
-            while cur_dur < seg_duration:
-                loop_clips.append(clip)
-                cur_dur += clip.duration
-            seg_clip = concatenate_videoclips(loop_clips).subclipped(0, seg_duration)
-            segment_clips.append(apply_zoom(seg_clip, seg_duration))
-        except Exception as e:
-            print(f"Could not use clip for '{query}' segment {seg_idx}: {e}")
-
-    if not segment_clips:
-        return ImageClip(np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)).with_duration(duration_needed)
-
-    combined = concatenate_videoclips(segment_clips)
-    if combined.duration < duration_needed:  # rounding can leave a hair short
-        last_frame = combined.get_frame(max(combined.duration - 0.04, 0))
-        pad = ImageClip(last_frame).with_duration(duration_needed - combined.duration)
-        combined = concatenate_videoclips([combined, pad])
-    return combined.subclipped(0, duration_needed)
+                cur = cand
+        if cur:
+            groups.append(cur)
+        starts = [0.0] + [min(g[0]["start"], duration) for g in groups[1:]]
+        for i, g in enumerate(groups):
+            end = starts[i + 1] if i + 1 < len(groups) else duration
+            if end - starts[i] > 0.05:
+                segments.append((" ".join(x["text"] for x in g).upper(), starts[i], end))
+    else:
+        chunks, cur = [], []
+        for word in caption_text.split():
+            cand = cur + [word]
+            if cur and (len(cand) > max_words or len(" ".join(cand)) > max_chars):
+                chunks.append(" ".join(cur))
+                cur = [word]
+            else:
+                cur = cand
+        if cur:
+            chunks.append(" ".join(cur))
+        weights = [len(c) + 2 for c in chunks] or [1]
+        total, start = sum(weights), 0.0
+        for c, wgt in zip(chunks, weights):
+            seg = duration * wgt / total
+            segments.append((c.upper(), start, start + seg))
+            start += seg
+    return segments
 
 
-def add_caption(bg_clip, caption_text, duration, word_timings=None, is_cta=False):
-    """Render on-screen captions. For normal scenes with word-level timing
-    from edge-tts, shows one word at a time exactly synced to the narration
-    (karaoke-style) - punchier and far better synced than a fixed-duration
-    chunk. Falls back to evenly-spaced 4-word chunks when no timing is
-    available (e.g. the gTTS fallback path), and shows the CTA line as one
-    static caption for the whole scene. Falls back to the plain background
-    clip if rendering fails for any reason, so the pipeline never crashes."""
+def add_caption(bg_clip, segments, duration, is_cta=False):
     try:
         caption_clips = []
-
-        if is_cta:
-            txt_clip = TextClip(
-                font=FONT_PATH, text=caption_text,
-                font_size=72, color="yellow",
-                stroke_color="black", stroke_width=3,
-                method="caption", size=(int(WIDTH * 0.85), None), text_align="center",
-            ).with_duration(duration).with_position(("center", int(HEIGHT * 0.72)))
-            caption_clips.append(txt_clip)
-
-        elif word_timings:
-            # Karaoke-style: one word at a time, precisely timed to speech.
-            for w in word_timings:
-                start = max(0, min(w["start"], duration))
-                end = max(start, min(w["end"], duration))
-                if end <= start:
-                    continue
-                txt_clip = TextClip(
-                    font=FONT_PATH, text=w["text"].upper(),
-                    font_size=78, color="white",
-                    stroke_color="black", stroke_width=3,
-                    method="caption", size=(int(WIDTH * 0.85), None), text_align="center",
-                ).with_duration(end - start).with_start(start).with_position(("center", int(HEIGHT * 0.72)))
-                caption_clips.append(txt_clip)
-            if not caption_clips:
-                raise ValueError("No usable word timings")
-
-        else:
-            # No timing available - fall back to evenly-spaced word chunks.
-            chunk_words = 4
-            words = caption_text.split()
-            chunks = [" ".join(words[i:i + chunk_words]) for i in range(0, len(words), chunk_words)] or [caption_text]
-            chunk_duration = duration / len(chunks)
-            for idx, chunk in enumerate(chunks):
-                txt_clip = TextClip(
-                    font=FONT_PATH, text=chunk,
-                    font_size=62, color="white",
-                    stroke_color="black", stroke_width=2,
-                    method="caption", size=(int(WIDTH * 0.85), None), text_align="center",
-                ).with_duration(chunk_duration).with_start(idx * chunk_duration).with_position(("center", int(HEIGHT * 0.72)))
-                caption_clips.append(txt_clip)
-
+        for idx, (text, start, end) in enumerate(segments):
+            txt = _text_clip(
+                text=text,
+                font_size=88 if is_cta else 84,
+                color="yellow" if is_cta else CAPTION_COLORS[idx % len(CAPTION_COLORS)],
+                stroke_color="black",
+                stroke_width=7,
+                method="caption",
+                size=(int(WIDTH * 0.88), None),
+                text_align="center",
+            )
+            y = int(HEIGHT * CAPTION_Y_RATIO - txt.h / 2)
+            caption_clips.append(txt.with_duration(end - start).with_start(start).with_position(("center", y)))
         return CompositeVideoClip([bg_clip] + caption_clips, size=(WIDTH, HEIGHT)).with_duration(duration)
     except Exception as e:
-        print(f"Caption failed for text '{caption_text[:30]}...': {e}")
+        print(f"Caption rendering failed: {e}")
         return bg_clip
 
 
-def add_title_flash(scene_clip, title_text, flash_duration=1.5):
-    """Overlay a big bold title card for the first ~1.5 seconds of the very
-    first scene, as a stronger scroll-stopping hook. Falls back to the plain
-    scene clip if anything goes wrong."""
+def add_title_flash(scene_clip, title_text, flash_duration=1.8):
     try:
         flash_len = min(flash_duration, scene_clip.duration)
-        title_clip = TextClip(
-            font=FONT_PATH,
+        title_clip = _text_clip(
             text=title_text.upper(),
-            font_size=80,
+            font_size=70,
             color="white",
             stroke_color="black",
-            stroke_width=4,
+            stroke_width=6,
             method="caption",
-            size=(int(WIDTH * 0.9), None),
+            size=(int(WIDTH * 0.88), None),
             text_align="center",
-        ).with_duration(flash_len).with_position(("center", "center"))
-
+        )
+        y = int(HEIGHT * 0.20 - title_clip.h / 2)
+        title_clip = title_clip.with_duration(flash_len).with_position(("center", y))
         return CompositeVideoClip([scene_clip, title_clip], size=(WIDTH, HEIGHT)).with_duration(scene_clip.duration)
     except Exception as e:
         print(f"Title flash failed: {e}")
         return scene_clip
 
 
-def add_background_music(narration_audio, duration):
-    """Mix a quiet, looped royalty-free track under the narration. Put a few
-    .mp3 files in a 'music' folder in the repo - one is picked at random each
-    run. If the folder is missing or empty, narration plays with no music."""
-    if not os.path.isdir(MUSIC_DIR):
-        print("No 'music' folder found, skipping background music.")
-        return narration_audio
+# ----------------------------------------------------------------------------
+# Audio extras
+# ----------------------------------------------------------------------------
 
+def add_background_music(narration_audio, duration):
+    if not os.path.isdir(MUSIC_DIR):
+        return narration_audio
     tracks = [f for f in os.listdir(MUSIC_DIR) if f.lower().endswith((".mp3", ".wav", ".m4a"))]
     if not tracks:
-        print("'music' folder is empty, skipping background music.")
         return narration_audio
-
     try:
-        track_path = os.path.join(MUSIC_DIR, random.choice(tracks))
-        music = AudioFileClip(track_path)
-
-        loop_clips = []
-        cur_dur = 0
+        music = AudioFileClip(os.path.join(MUSIC_DIR, random.choice(tracks)))
+        loop_clips, cur_dur = [], 0
         while cur_dur < duration:
             loop_clips.append(music)
             cur_dur += music.duration
         music_full = concatenate_audioclips(loop_clips).subclipped(0, duration)
-        music_quiet = music_full.with_volume_scaled(0.15)  # keep narration clearly audible
-
-        return CompositeAudioClip([narration_audio, music_quiet])
+        return CompositeAudioClip([narration_audio, music_full.with_volume_scaled(0.10)])
     except Exception as e:
-        print(f"Background music failed, continuing without it: {e}")
+        print(f"Background music error: {e}")
         return narration_audio
 
 
+def add_sfx_transitions(audio, transition_times, duration):
+    if not os.path.isdir(SFX_DIR):
+        return audio
+    files = [f for f in os.listdir(SFX_DIR) if f.lower().endswith((".mp3", ".wav", ".m4a"))]
+    if not files:
+        return audio
+    preferred = [f for f in files if f.lower().startswith("whoosh")]
+    sfx_path = os.path.join(SFX_DIR, random.choice(preferred or files))
+    try:
+        layers = [audio]
+        for t in transition_times:
+            if 0 < t < duration:
+                sfx = AudioFileClip(sfx_path)
+                sfx = sfx.subclipped(0, min(1.0, sfx.duration)).with_volume_scaled(0.45)
+                layers.append(sfx.with_start(max(t - 0.12, 0)))
+        return CompositeAudioClip(layers)
+    except Exception as e:
+        print(f"SFX error: {e}")
+        return audio
+
+
+def silence_clip(duration):
+    def frame(t):
+        t = np.asarray(t)
+        return np.zeros((*t.shape, 2))
+    return AudioClip(frame, duration=duration, fps=44100)
+
+
+# ----------------------------------------------------------------------------
+# YouTube
+# ----------------------------------------------------------------------------
+
 def get_youtube_client():
-    """Build an authenticated YouTube API client from the TOKEN_JSON and
-    CLIENT_SECRET_JSON secrets, refreshing the access token if needed."""
     token_raw = os.environ.get("TOKEN_JSON")
     client_raw = os.environ.get("CLIENT_SECRET_JSON")
 
-    if not token_raw:
-        raise RuntimeError("TOKEN_JSON secret is missing or empty.")
-    if not client_raw:
-        raise RuntimeError("CLIENT_SECRET_JSON secret is missing or empty.")
+    if not token_raw or not client_raw:
+        raise RuntimeError("Missing TOKEN_JSON or CLIENT_SECRET_JSON secret.")
 
     token_data = json.loads(token_raw)
     client_data = json.loads(client_raw)
@@ -584,28 +719,16 @@ def get_youtube_client():
         if creds.refresh_token:
             creds.refresh(Request())
         else:
-            raise RuntimeError(
-                "Stored credentials are invalid/expired and no refresh_token is available. "
-                "You'll need to regenerate TOKEN_JSON."
-            )
+            raise RuntimeError("Invalid TOKEN_JSON: no refresh_token available.")
 
     return build("youtube", "v3", credentials=creds)
 
 
 def upload_to_youtube(video_path, title, description, tags, category_id="27"):
     youtube = get_youtube_client()
-
     body = {
-        "snippet": {
-            "title": title,
-            "description": description,
-            "tags": tags,
-            "categoryId": category_id,
-        },
-        "status": {
-            "privacyStatus": "public",
-            "selfDeclaredMadeForKids": False,
-        },
+        "snippet": {"title": title[:100], "description": description, "tags": tags, "categoryId": category_id},
+        "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": False},
     }
 
     media = MediaFileUpload(video_path, chunksize=-1, resumable=True, mimetype="video/mp4")
@@ -617,22 +740,12 @@ def upload_to_youtube(video_path, title, description, tags, category_id="27"):
         if status:
             print(f"Upload progress: {int(status.progress() * 100)}%")
 
-    video_id = response["id"]
-    print(f"Uploaded successfully: https://youtube.com/shorts/{video_id}")
-    return video_id
+    print(f"Uploaded: https://youtube.com/shorts/{response['id']}")
+    return response["id"]
 
 
 def update_tracker(video_id, title, content_type, subtopic=None):
-    data = []
-    if os.path.exists(TRACKER_FILE):
-        try:
-            with open(TRACKER_FILE) as f:
-                data = json.load(f)
-            if not isinstance(data, list):
-                data = []
-        except Exception:
-            data = []
-
+    data = _read_tracker()
     data.append({
         "video_id": video_id,
         "title": title,
@@ -641,79 +754,92 @@ def update_tracker(video_id, title, content_type, subtopic=None):
         "uploaded_at": datetime.now(timezone.utc).isoformat(),
         "url": f"https://youtube.com/shorts/{video_id}",
     })
-
     with open(TRACKER_FILE, "w") as f:
         json.dump(data, f, indent=2)
 
 
-def generate_video():
-    target_duration = round(random.uniform(MIN_DURATION, MAX_DURATION), 1)
-    content_type = get_run_config()
+# ----------------------------------------------------------------------------
+# Main pipeline
+# ----------------------------------------------------------------------------
 
+def generate_video():
+    content_type = get_run_config()
     subtopic = pick_subtopic() if content_type == "ai_tips" else None
-    script = generate_best_script(content_type, subtopic)
+
+    script = generate_script_with_ai(content_type, subtopic)
     title = script["title"]
     scenes = list(script["scenes"]) + [CTA_SCENE]
+    base_seed = random.randint(1, 900000)
 
-    print(f"Content type: {content_type} | Subtopic: {subtopic} | Topic: {title} | Target duration: {target_duration}s")
+    print(f"Type: {content_type} | Style: {VIDEO_STYLE} | Subtopic: {subtopic} | Title: {title}")
 
-    used_video_ids = set()  # avoid the same stock clip showing up twice in one video
-    audio_clips = []
-    video_clips = []
+    audio_clips, video_clips = [], []
     for i, scene in enumerate(scenes):
         fname = f"part_{i}.mp3"
         word_timings = synthesize_speech(scene["text"], fname)
         aclip = AudioFileClip(fname)
         audio_clips.append(aclip)
+        duration = aclip.duration
 
-        bg_clip = fetch_clip(scene["query"], aclip.duration, i, used_video_ids)
-        is_cta = scene.get("cta", False)
-        caption_text = scene.get("caption") or scene["text"]
-        scene_clip = add_caption(bg_clip, caption_text, aclip.duration, word_timings=word_timings, is_cta=is_cta)
+        env = audio_envelope(aclip)
+        segments = build_caption_segments(scene["text"], word_timings, duration)
+        punch_times = [s[1] for s in segments]
+
+        bg_clip = build_scene_background(scene, duration, i, base_seed, env, punch_times)
+        scene_clip = add_caption(bg_clip, segments, duration, is_cta=scene.get("cta", False)) if CAPTIONS_ENABLED else bg_clip
         if i == 0:
             scene_clip = add_title_flash(scene_clip, title)
         video_clips.append(scene_clip)
 
+    transition_times, t = [], 0.0
+    for a in audio_clips[:-1]:
+        t += a.duration
+        transition_times.append(t)
+
     final_audio = concatenate_audioclips(audio_clips)
     final_video = concatenate_videoclips(video_clips)
-
     current_duration = min(final_audio.duration, final_video.duration)
 
-    if current_duration > target_duration:
-        final_audio = final_audio.subclipped(0, target_duration)
-        final_video = final_video.subclipped(0, target_duration)
-    elif current_duration < target_duration:
-        pad = target_duration - current_duration
-        silence = AudioClip(lambda t: 0, duration=pad, fps=44100)
-        final_audio = concatenate_audioclips([final_audio, silence])
-
+    # Keep the natural length (no mid-sentence cuts); only enforce the limits.
+    if current_duration > MAX_DURATION:
+        final_audio = final_audio.subclipped(0, MAX_DURATION)
+        final_video = final_video.subclipped(0, MAX_DURATION)
+    elif current_duration < MIN_DURATION:
+        pad = MIN_DURATION - current_duration
+        final_audio = concatenate_audioclips([final_audio, silence_clip(pad)])
         last_frame = final_video.get_frame(max(final_video.duration - 0.04, 0))
-        freeze = ImageClip(last_frame).with_duration(pad)
-        final_video = concatenate_videoclips([final_video, freeze])
+        final_video = concatenate_videoclips([final_video, ImageClip(last_frame).with_duration(pad)])
 
     final_duration = min(final_audio.duration, final_video.duration)
     final_audio = final_audio.subclipped(0, final_duration)
     final_video = final_video.subclipped(0, final_duration)
 
     final_audio = add_background_music(final_audio, final_duration)
+    final_audio = add_sfx_transitions(final_audio, transition_times, final_duration)
+    final_audio = final_audio.with_duration(final_duration)
+    try:
+        final_audio = final_audio.with_effects([afx.AudioFadeOut(0.4)])
+    except Exception as e:
+        print(f"Audio fade-out skipped: {e}")
 
     final = final_video.with_audio(final_audio)
-    output_path = "final_short.mp4"
-    final.write_videofile(output_path, fps=30, codec="libx264", audio_codec="aac", bitrate="5000k")
+    output_path = "final_short_cartoon.mp4"
+    final.write_videofile(
+        output_path, fps=30, codec="libx264", audio_codec="aac",
+        bitrate="6000k", preset="veryfast", threads=4,
+    )
 
-    if content_type == "ai_tips":
-        base_tags = ["ai", "aitips", "chatgpt", "productivity", "shorts"]
-    else:
-        base_tags = ["shorts", "facts", "didyouknow"]
-
+    base_tags = ["ai", "aitips", "chatgpt", "animation", "shorts"]
     ai_hashtags = [h.strip().lstrip("#").lower() for h in script.get("hashtags", []) if h.strip()]
-    all_tags = list(dict.fromkeys(ai_hashtags + base_tags))  # AI's topic-specific tags first, deduped
+    all_tags = list(dict.fromkeys(ai_hashtags + base_tags))
 
     hashtag_line = " ".join(f"#{t}" for t in all_tags[:8])
-    subscribe_line = "Subscribe for a new video every single day!"
-    description = f"{title}\n\n{subscribe_line}\n\n{hashtag_line}"
+    description = f"{title}\n\nSubscribe for a new AI trick every single day!\n\n{hashtag_line}"
 
-    video_id = upload_to_youtube(output_path, title, description, all_tags, category_id=CATEGORY_IDS.get(content_type, "27"))
+    video_id = upload_to_youtube(
+        output_path, title, description, all_tags,
+        category_id=CATEGORY_IDS.get(content_type, "27"),
+    )
     update_tracker(video_id, title, content_type, subtopic)
 
 
