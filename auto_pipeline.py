@@ -295,6 +295,13 @@ def generate_script_with_ai(content_type, language, max_attempts=3):
                 if language == "ur" and not scene.get("caption_roman"):
                     raise ValueError("A scene in the AI response is missing 'caption_roman'.")
 
+            # Enforce a strong hook: reject question / "did you know" openers and retry
+            first = data["scenes"][0]["text"].strip()
+            if first.endswith(("?", "\u061f")) or first.lower().startswith(
+                ("did you know", "have you ever", "what if", "imagine")
+            ):
+                raise ValueError(f"Weak hook (question opener): {first[:60]}")
+
             print(f"Gemini script generated successfully on attempt {attempt}/{max_attempts}.")
             return data
 
