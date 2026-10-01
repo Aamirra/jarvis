@@ -1,50 +1,67 @@
-name: Galaxy Shorts Auto Pipeline
+name: Cartoon Channel Upload
 
 on:
   schedule:
-    - cron: '0 8,20 * * *'
+    - cron: "30 */8 * * *"
   workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: cartoon-upload
+  cancel-in-progress: false
+
 jobs:
-  build-and-run:
+  generate-and-upload:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     steps:
-    - name: Checkout Repository
-      uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.10'
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-    - name: Install System Dependencies (Fonts)
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y fonts-dejavu-core ffmpeg
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-dejavu-core
 
-    - name: Install Python Dependencies
-      run: |
-        python -m pip install --upgrade pip
-        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install --no-cache-dir --upgrade -r requirements.txt
 
-    - name: Run Galaxy Shorts Script
-      env:
-        GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
-        TOKEN_JSON: ${{ secrets.TOKEN_JSON_NEW_CHANNEL }}
-        CLIENT_SECRET_JSON: ${{ secrets.CLIENT_SECRET_JSON_NEW_CHANNEL }}
-      run: |
-        python galaxy_shorts_pipeline.py
+      - name: Install optional talking-effect tools
+        run: pip install rembg onnxruntime || true
 
-    - name: Save upload tracker
-      if: success()
-      run: |
-        git config user.name "github-actions[bot]"
-        git config user.email "github-actions[bot]@users.noreply.github.com"
-        git add upload_tracker.json
-        git commit -m "Update upload tracker" || echo "Nothing to commit"
-        git push
+      - name: Generate Video and Upload to YouTube
+        env:
+          TOKEN_JSON: ${{ secrets.TOKEN_JSON_CARTOON }}
+          CLIENT_SECRET_JSON: ${{ secrets.CLIENT_SECRET_JSON }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          POLLINATIONS_TOKEN: ${{ secrets.POLLINATIONS_TOKEN }}
+        run: python cartoon_pipeline.py
+
+      - name: Commit upload tracker
+        if: success()
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add upload_tracker_cartoon.json || true
+          git commit -m "Update cartoon tracker" || exit 0
+          git pull --rebase || true
+          git push
+
+      - name: Save video
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cartoon-video-${{ github.run_id }}
+          path: final_short_cartoon.mp4
+          retention-days: 2
+          if-no-files-found: warn
