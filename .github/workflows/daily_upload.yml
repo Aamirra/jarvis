@@ -2,12 +2,20 @@ name: Daily YouTube Shorts Upload
 
 on:
   schedule:
-    - cron: "0 */4 * * *"   # runs 6 times a day, every 4 hours (UTC)
+    - cron: "0 */4 * * *"
   workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: shorts-upload
+  cancel-in-progress: false
 
 jobs:
   generate-and-upload:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repository
@@ -26,15 +34,26 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install --no-cache-dir -r requirements.txt
+          pip install --no-cache-dir --upgrade -r requirements.txt
 
       - name: Generate Video and Upload to YouTube
         env:
           TOKEN_JSON: ${{ secrets.TOKEN_JSON }}
           CLIENT_SECRET_JSON: ${{ secrets.CLIENT_SECRET_JSON }}
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python auto_pipeline.py
+
+      - name: Commit upload tracker
+        if: success()
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add upload_tracker.json || true
+          git commit -m "Update upload tracker" || exit 0
+          git pull --rebase || true
+          git push
 
       - name: Save video for manual TikTok upload
         if: always()
