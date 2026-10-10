@@ -1,21 +1,21 @@
-name: Daily YouTube Shorts Upload
+name: Daily Rumble + YouTube Video
 
 on:
   schedule:
-    - cron: "0 */4 * * *"
+    - cron: "0 12 * * *"   # 1 video/day, 12:00 UTC = 5:00 PM Pakistan time
   workflow_dispatch:
 
 permissions:
   contents: write
 
 concurrency:
-  group: shorts-upload
+  group: daily-video
   cancel-in-progress: false
 
 jobs:
-  generate-and-upload:
+  generate-video:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - name: Checkout repository
@@ -36,14 +36,26 @@ jobs:
           python -m pip install --upgrade pip
           pip install --no-cache-dir --upgrade -r requirements.txt
 
-      - name: Generate Video and Upload to YouTube
+      - name: Generate video and upload to YouTube
         env:
-          TOKEN_JSON: ${{ secrets.TOKEN_JSON }}
-          CLIENT_SECRET_JSON: ${{ secrets.CLIENT_SECRET_JSON }}
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
           PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: python auto_pipeline.py
+          TOKEN_JSON: ${{ secrets.TOKEN_JSON }}
+          CLIENT_SECRET_JSON: ${{ secrets.CLIENT_SECRET_JSON }}
+          UPLOAD_TO_YOUTUBE: "1"
+        run: python rumble_video.py
+
+      - name: Save video for manual Rumble upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rumble-video-${{ github.run_id }}
+          path: |
+            final_video.mp4
+            rumble_upload.txt
+          retention-days: 7
+          if-no-files-found: warn
 
       - name: Commit upload tracker
         if: success()
@@ -54,12 +66,3 @@ jobs:
           git commit -m "Update upload tracker" || exit 0
           git pull --rebase || true
           git push
-
-      - name: Save video for manual TikTok upload
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: tiktok-video-${{ github.run_id }}
-          path: final_short.mp4
-          retention-days: 2
-          if-no-files-found: warn
